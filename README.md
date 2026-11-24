@@ -4,6 +4,15 @@
 
 The port uses software barriers for SM120a, keeps selected experts in system RAM, and stages them in 256 MiB chunks during prefill. It converts four MXFP8 expert layers to NVFP4. The serving profile uses FP8 KV cache and DSpark.
 
+## Strata vs TWinkling on RTX 5080
+
+| Profile | Chat reply | Code reply |
+| --- | ---: | ---: |
+| Strata · SQ10, 32K | 145.7 tok/s | 173.0 tok/s |
+| TWinkling · NVFP4, 64K | 141.9 tok/s | 145.3 tok/s |
+
+Median of three warm requests per workload. Same RTX 5080, same two prompts, 320 output tokens per reply, and a 250 W cap. Rates cover the whole request. The profiles use different quantizations and context sizes. [Raw measurements](benchmarks/rtx5080/strata-comparison.json)
+
 ## Run on an RTX 5080
 
 Use Linux x86-64 or Windows with WSL2. The checked Windows setup used Ubuntu 26.04 under WSL2. You need an NVIDIA CUDA 13-capable driver, a C++20 compiler, Git and curl. Reserve about 40 GB of disk and system RAM for the downloaded checkpoint and conversion. The CUDA toolkit and model pack are pinned in [runtime-manifest.json](runtime-manifest.json).

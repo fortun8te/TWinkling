@@ -1,0 +1,108 @@
+{
+  "gpu": "RTX 5080 16 GB",
+  "configured_power_limit_w": 250,
+  "date": "2026-11-24",
+  "measure": "320 provider-counted output tokens divided by full warm non-streaming HTTP request time; median of three runs per profile and prompt",
+  "profiles": {
+    "Strata": "v0.2.20, SQ10, 32K",
+    "TWinkling": "NVFP4 experts with host staging, 64K"
+  },
+  "runs": [
+    {
+      "profile": "Strata",
+      "model": "inkling-2-mini-sq-10",
+      "workload": "chat",
+      "output_tokens": 320,
+      "wall_s": 2.217,
+      "output_tok_s": 144.36
+    },
+    {
+      "profile": "Strata",
+      "model": "inkling-2-mini-sq-10",
+      "workload": "code",
+      "output_tokens": 320,
+      "wall_s": 1.838,
+      "output_tok_s": 174.15
+    },
+    {
+      "profile": "Strata",
+      "model": "inkling-2-mini-sq-10",
+      "workload": "chat",
+      "output_tokens": 320,
+      "wall_s": 2.184,
+      "output_tok_s": 146.53
+    },
+    {
+      "profile": "Strata",
+      "model": "inkling-2-mini-sq-10",
+      "workload": "code",
+      "output_tokens": 320,
+      "wall_s": 1.85,
+      "output_tok_s": 173.01
+    },
+    {
+      "profile": "Strata",
+      "model": "inkling-2-mini-sq-10",
+      "workload": "chat",
+      "output_tokens": 320,
+      "wall_s": 2.196,
+      "output_tok_s": 145.71
+    },
+    {
+      "profile": "Strata",
+      "model": "inkling-2-mini-sq-10",
+      "workload": "code",
+      "output_tokens": 320,
+      "wall_s": 1.894,
+      "output_tok_s": 168.93
+    },
+    {
+      "profile": "TWinkling",
+      "model": "inkling-2-mini-abliterated",
+      "workload": "chat",
+      "output_tokens": 320,
+      "wall_s": 2.113,
+      "output_tok_s": 151.44
+    },
+    {
+      "profile": "TWinkling",
+      "model": "inkling-2-mini-abliterated",
+      "workload": "code",
+      "output_tokens": 320,
+      "wall_s": 2.217,
+      "output_tok_s": 144.35
+    },
+    {
+      "profile": "TWinkling",
+      "model": "inkling-2-mini-abliterated",
+      "workload": "chat",
+      "output_tokens": 320,
+      "wall_s": 2.315,
+      "output_tok_s": 138.21
+    },
+    {
+      "profile": "TWinkling",
+      "model": "inkling-2-mini-abliterated",
+      "workload": "code",
+      "output_tokens": 320,
+      "wall_s": 2.203,
+      "output_tok_s": 145.27
+    },
+    {
+      "profile": "TWinkling",
+      "model": "inkling-2-mini-abliterated",
+      "workload": "chat",
+      "output_tokens": 320,
+      "wall_s": 2.255,
+      "output_tok_s": 141.89
+    },
+    {
+      "profile": "TWinkling",
+      "model": "inkling-2-mini-abliterated",
+      "workload": "code",
+      "output_tokens": 320,
+      "wall_s": 2.193,
+      "output_tok_s": 145.93
+    }
+  ]
+}
