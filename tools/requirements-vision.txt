@@ -1,0 +1,8 @@
+# CPU-only environment of tools/vision_ref.py and tools/vision_fixtures.py (no GPU, no language model).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0
+torchvision
+transformers @ git+https://github.com/huggingface/transformers@6173a2f679ff4ed393afc499aefc569da7e68bc1
+safetensors
+numpy
+pillow
