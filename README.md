@@ -4,15 +4,6 @@
 
 The port uses software barriers for SM120a, keeps selected experts in system RAM, and stages them in 256 MiB chunks during prefill. It converts four MXFP8 expert layers to NVFP4. The serving profile uses FP8 KV cache and DSpark.
 
-## PURE default vs TWinkling on RTX 5080
-
-| Profile | Chat | Code |
-| --- | ---: | ---: |
-| PURE default · 256K, Vision | 149.6 tok/s | 150.1 tok/s |
-| TWinkling · 64K, text | 156.0 tok/s | 159.4 tok/s |
-
-Same card, same two short prompts, 320 generated tokens per reply, 250 W power limit. These profiles use different quantizations and context allocations. [Per-run measurements](benchmarks/rtx5080/profile-comparison.json)
-
 ## Run on an RTX 5080
 
 Use Linux x86-64 or Windows with WSL2. The checked Windows setup used Ubuntu 26.04 under WSL2. You need an NVIDIA CUDA 13-capable driver, a C++20 compiler, Git and curl. Reserve about 40 GB of disk and system RAM for the downloaded checkpoint and conversion. The CUDA toolkit and model pack are pinned in [runtime-manifest.json](runtime-manifest.json).
