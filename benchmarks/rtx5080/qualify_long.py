@@ -224,6 +224,18 @@ def request(args, prompt, output_limit, tools=None, followup=()):
             'tool_calls': [calls[index] for index in sorted(calls)]}
 
 
+def recall_after_turn(args, prompt, previous, expected, depth, output_limit, tools=None, history=()):
+    followup = list(history) + [
+        {'role': 'assistant', 'content': previous['output']},
+        {'role': 'user', 'content': 'Now return a JSON object with the three approved archive keys. '
+                                   'Use exactly the fields north, central, and south. Do not call a tool.'},
+    ]
+    recall = request(args, prompt, output_limit, tools=tools, followup=followup)
+    passed = (previous['usage']['prompt_tokens'] < recall['usage']['prompt_tokens'] <= depth - output_limit
+              and not recall['tool_calls'] and check_answer('recall', recall, expected, output_limit))
+    return recall, passed
+
+
 def tool_round_trip(args, prompt, expected, depth, output_limit, recall_expected=None):
     tools = [LOOKUP_TOOL]
     first = request(args, prompt, output_limit, tools=tools)
@@ -253,17 +265,11 @@ def tool_round_trip(args, prompt, expected, depth, output_limit, recall_expected
     if recall_expected is not None:
         first['recall_followup_pass'] = False
         if first['tool_round_trip_pass']:
-            recall_history = followup + [
-                {'role': 'assistant', 'content': final['output']},
-                {'role': 'user', 'content': 'Now return a JSON object with the three approved archive keys. '
-                                           'Use exactly the fields north, central, and south. Do not call a tool.'},
-            ]
-            recall = request(args, prompt, output_limit, tools=tools, followup=recall_history)
+            recall, passed = recall_after_turn(args, prompt, final, recall_expected, depth, output_limit,
+                                               tools=tools, history=followup)
             first['recall_followup'] = recall
             first['workflow_s'] = first['tool_round_trip_s'] + recall['total_s']
-            first['recall_followup_pass'] = (final['usage']['prompt_tokens'] < recall['usage']['prompt_tokens']
-                                            <= depth - output_limit and not recall['tool_calls']
-                                            and check_answer('recall', recall, recall_expected, output_limit))
+            first['recall_followup_pass'] = passed
     return first
 
 
@@ -295,7 +301,7 @@ def check_answer(kind, reply, expected, output_limit):
     if reply['finish'] != 'stop':
         return False
     if kind == 'code':
-        return check_code(reply['output'])
+        return check_code(reply['output']) and reply.get('recall_followup_pass', True)
     try:
         return json.loads(unfence(reply['output'])) == expected
     except ValueError:
@@ -309,7 +315,7 @@ def main():
     parser.add_argument('--depth', type=int, action='append', help='allocated window in tokens, repeatable')
     parser.add_argument('--ramp', action='store_true', help='use 16K, 64K, 128K, and 256K when no --depth is given')
     parser.add_argument('--case', choices=('recall', 'code', 'decode', 'tool'), action='append')
-    parser.add_argument('--follow-recall', action='store_true', help='append exact long-context recall to the tool workflow')
+    parser.add_argument('--follow-recall', action='store_true', help='append exact recall to a coding or tool workflow')
     parser.add_argument('--mode', choices=('cold', 'both'), default='both',
                         help='cold only, or repeat the same document with a changed query')
     parser.add_argument('--repeat', type=int, default=1)
@@ -364,6 +370,15 @@ def main():
                             reply = tool_round_trip(args, prompt, expected, depth, args.output_tokens, recall_expected)
                         else:
                             reply = request(args, prompt, args.output_tokens)
+                            if kind == 'code' and args.follow_recall:
+                                passed = False
+                                if check_answer(kind, reply, expected, args.output_tokens):
+                                    recall_expected = document(rows, 'recall', seed)[1]
+                                    recall, passed = recall_after_turn(args, prompt, reply, recall_expected, depth,
+                                                                       args.output_tokens)
+                                    reply['recall_followup'] = recall
+                                    reply['workflow_s'] = reply['total_s'] + recall['total_s']
+                                reply['recall_followup_pass'] = passed
                         tokens = reply['usage']['prompt_tokens']
                         in_range = depth - args.headroom - args.depth_tolerance <= tokens <= depth - args.output_tokens
                         rec.update(reply, depth_pass=in_range,
