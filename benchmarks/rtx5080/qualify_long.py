@@ -119,8 +119,7 @@ def check_code(value):
         builtins = {'min': min, 'max': max, 'sorted': sorted}
         if len(nodes) > 100 or any(not isinstance(node, allowed) for node in nodes):
             return False
-        if sum(isinstance(node, ast.comprehension) for node in nodes) > 1:
-            return False
+        comprehensions = (ast.ListComp, ast.GeneratorExp)
         for node in nodes:
             if isinstance(node, ast.Call):
                 safe_builtin = isinstance(node.func, ast.Name) and node.func.id in builtins
@@ -131,6 +130,9 @@ def check_code(value):
             if isinstance(node, ast.Name) and node.id.startswith('_'):
                 return False
             if isinstance(node, ast.comprehension) and (not isinstance(node.iter, ast.Name) or node.iter.id != 'rows'):
+                return False
+            if isinstance(node, comprehensions) and (len(node.generators) != 1 or any(
+                    child is not node and isinstance(child, comprehensions) for child in ast.walk(node))):
                 return False
         code = compile(expr, '<bounded ticket selector>', 'eval')
         return all(eval(code, {'__builtins__': {}, **builtins, 'rows': rows}) == expected
