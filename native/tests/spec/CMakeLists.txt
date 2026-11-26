@@ -1,3 +1,5 @@
+ingine_add_test(NAME spec_suffix_lookup SOURCES test_suffix_lookup.cpp)
+
 ingine_add_test(NAME spec_draft_kernels SOURCES test_draft_kernels.cpp LIBS ingine_kernels_draft CUDA::cudart
                 GPU ORACLE TIMEOUT 300)
 ingine_add_test(NAME spec_accept SOURCES test_accept.cpp LIBS ingine_kernels_draft CUDA::cudart GPU ORACLE

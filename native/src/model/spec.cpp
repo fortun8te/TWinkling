@@ -3,8 +3,10 @@
 #include "core/device.h"
 #include "kernels/draft/draft.h"
 #include "model/model_kernels.h"
+#include "model/suffix_lookup.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <stdexcept>
 
@@ -22,7 +24,13 @@ std::uint64_t splitmix64(std::uint64_t x) {
   return x ^ (x >> 31);
 }
 
+static_assert(SuffixLookup::Proposal{}.tokens.size() == kd::GAMMA);
 static_assert(sizeof(VerifyRecord::drafts) / sizeof(std::int32_t) == kd::GAMMA);
+
+struct SuffixInput {
+  std::array<std::int32_t, kd::GAMMA> tokens;
+  std::array<float, kd::GAMMA> confidence;
+};
 
 Widths verify_widths(const Runtime& rt) {
   const std::span<const int> w = rt.verify_widths();
@@ -45,16 +53,23 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
   draft_ = drafter.draft(0, 0, 0.f);
   drafter.reset();
   width_.fill(0);
-  const float threshold = rt.options().spec_threshold;
-  verify_ = rt.capture_switch(
+  auto capture_verify = [&](const float* confidence, const std::int32_t* proposals, float threshold) {
+    return rt.capture_switch(
       [&](cudaStream_t s, cudaGraphConditionalHandle h) {
-        verify_select(draft_.conf, draft_.tokens, threshold, widths, rt_.tokens(), static_cast<std::int32_t*>(width_.p),
+        verify_select(confidence, proposals, threshold, widths, rt_.tokens(), static_cast<std::int32_t*>(width_.p),
                       h, s);
       },
       [&](cudaStream_t s, int m) {
         rt_.record_save_verify(m, s);
         rt_.record_step(m, s);
       });
+  };
+  verify_ = capture_verify(draft_.conf, draft_.tokens, rt.options().spec_threshold);
+  if (rt.options().suffix_draft) {
+    suffix_input_ = MappedHostBuffer(sizeof(SuffixInput));
+    const auto* input = static_cast<const SuffixInput*>(suffix_input_.device_ptr());
+    suffix_verify_ = capture_verify(input->confidence.data(), input->tokens.data(), 0.5f);
+  }
   // where a round's outcome lives on the device: after the acceptance the drafter commits the accepted
   // rows and drafts for the next anchor from these (one graph, no host round trip in between)
   {
@@ -94,7 +109,9 @@ void SpecLoop::prepare_accept(const Sampling& sampling) {
   // forced replay: the drafts are compared with the forced tokens (the argmax still runs, for the timing)
   const auto* target = forced ? static_cast<const std::int32_t*>(forced_window_.device_ptr()) : scratch.target;
   accept_ = GraphExec();
-  accept_ = rt_.capture_switch(
+  suffix_accept_ = GraphExec();
+  auto capture_accept = [&](const std::int32_t* proposals) {
+    return rt_.capture_switch(
       [&](cudaStream_t s, cudaGraphConditionalHandle h) { width_select(width, widths, h, s); },
       [&](cudaStream_t s, int m) {
         // engine._accept over the m verify rows (anchor + m - 1 drafts)
@@ -102,7 +119,7 @@ void SpecLoop::prepare_accept(const Sampling& sampling) {
         const int n = m - 1;
         if (greedy) {
           kh::argmax(logits, m, V, V, scratch.target, s);
-          kd::greedy_accept(target, draft_.tokens, n, scratch.result, s);
+          kd::greedy_accept(target, proposals, n, scratch.result, s);
         } else {
           kh::sampling_probs(logits, m, V, V, params, scratch.probs, s);
           kd::sampled_accept(scratch.probs, draft_.logits, V, draft_.tokens, n, sampling.temperature, draft_.qstats,
@@ -112,6 +129,12 @@ void SpecLoop::prepare_accept(const Sampling& sampling) {
         verify_publish(width, &scratch.result->accepted, greedy ? &scratch.result->next : nullptr, rt_.tokens(), record,
                        s);
       });
+  };
+  accept_ = capture_accept(draft_.tokens);
+  if (greedy && !forced && rt_.options().suffix_draft) {
+    const auto* input = static_cast<const SuffixInput*>(suffix_input_.device_ptr());
+    suffix_accept_ = capture_accept(input->tokens.data());
+  }
   accept_key_ = key;
 }
 
@@ -132,6 +155,11 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
   prepare_accept(sampling);
   if (sampling.temperature > 0.f) drafter_.set_seed(splitmix64(rng.seed ^ splitmix64(rng.counter++)));
 
+  const bool lookup_enabled = rt_.options().suffix_draft && greedy && !forced;
+  SuffixLookup lookup;
+  constexpr int kSuffixPause = 8;
+  int suffix_rounds = 0, suffix_accepted = 0, try_suffix_after = 0, misses = 0;
+  bool draft_ready = !lookup_enabled;
   int emitted = 0, rounds = 0, accepted = 0;
   std::vector<std::int32_t> out{token};
   // the last verify call (none before the first round): its position, width and accepted drafts
@@ -147,7 +175,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
   };
   // the first draft; later ones are enqueued by the previous round (they leave the target state alone, so
   // the last one is wasted when the generation ends) and run while the host emits
-  drafter_.draft(token, P, sampling.temperature);
+  if (draft_ready) drafter_.draft(token, P, sampling.temperature);
   for (;;) {
     const std::int32_t anchor = out.back();
 
@@ -180,6 +208,24 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
 
     // verify the confident drafts in the width the device picks, accept, roll back the rejected rows; then
     // commit the accepted rows and draft for the next anchor, all from device values
+    bool suffix_hit = false;
+    if (lookup_enabled) {
+      if (rounds >= try_suffix_after) {
+        const int limit = std::min(max_new_tokens - emitted, rt_.options().max_ctx - P - 1);
+        const auto proposal = lookup.find(tokens_in_state, anchor, limit, V);
+        if (proposal.count != 0) {
+          auto* mapped = static_cast<SuffixInput*>(suffix_input_.data());
+          mapped->tokens = proposal.tokens;
+          for (int i = 0; i < kd::GAMMA; ++i) mapped->confidence[i] = i < proposal.count ? 1.f : 0.f;
+          suffix_hit = true;
+          misses = 0;
+        } else if (++misses == 4) {
+          try_suffix_after = rounds + 1 + kSuffixPause;
+          misses = 0;
+        }
+      }
+      if (!suffix_hit && !draft_ready) drafter_.draft(anchor, P, sampling.temperature);
+    }
     const std::int32_t inputs[1] = {anchor};
     rt_.set_inputs(inputs, P);
     if (forced) {  // the forced tokens after the anchor (forced[emitted - 1]); the accept graph reads them
@@ -190,12 +236,15 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       record_event(0);
     }
     if (!greedy) kh::uniform(kd::GAMMA, rng, scratch.uniforms, stream);
-    verify_.launch(stream);
-    accept_.launch(stream);
+    (suffix_hit ? suffix_verify_ : verify_).launch(stream);
+    (suffix_hit ? suffix_accept_ : accept_).launch(stream);
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);
     CUDA_CHECK(cudaEventRecord(done_, stream));
     if (forced) record_event(1);
-    drafter_.advance(P);
+    // A cold lookup path goes back to the normal pipelined DSpark path
+    // during a pause. Only the next active lookup needs a host decision.
+    draft_ready = !lookup_enabled || rounds + 1 < try_suffix_after;
+    if (draft_ready) drafter_.advance(P);
     if (forced) record_event(2);
     CUDA_CHECK(cudaEventSynchronize(done_));  // the round's only host synchronisation
     VerifyRecord r;
@@ -213,7 +262,18 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       stats.spec_trace.push_back({r.m, acc, all, 0.f, 0.f});
     }
 
-    drafter_.advanced(commit);
+    if (draft_ready) {
+      drafter_.advanced(commit);
+    } else {
+      // Keep the draft model warm for lookup misses without predicting
+      // until we know whether the next suffix has a match.
+      drafter_.commit(ptr<const __nv_bfloat16>(rt_.buffers(r.m).taps), commit, P);
+    }
+    if (suffix_hit) {
+      ++suffix_rounds;
+      suffix_accepted += acc;
+      if (acc < 2) try_suffix_after = rounds + 1 + kSuffixPause;
+    }
     tokens_in_state.push_back(anchor);
     tokens_in_state.insert(tokens_in_state.end(), r.drafts, r.drafts + acc);
     P += commit;
@@ -234,6 +294,8 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
   }
   stats.spec_rounds = rounds;
   stats.spec_accepted = accepted;
+  stats.spec_suffix_rounds = suffix_rounds;
+  stats.spec_suffix_accepted = suffix_accepted;
 }
 
 }  // namespace ingine::model

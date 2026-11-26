@@ -78,7 +78,8 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_v4);
+  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_v4, options.elastic_kv);
+  state_.ensure_full_rows(kMaxWidth);  // eager graph warmup writes starting at position 0
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
@@ -264,15 +265,27 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   if (n < 0 || n > options_.max_ctx)
     throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
                                 std::to_string(options_.max_ctx) + "]");
-  const std::size_t position = (state_.k_full.bytes() + state_.v_full.bytes()) / std::size_t(options_.max_ctx);
+  const std::size_t position = (state_.k_full_at(0).bytes() + state_.v_full_at(0).bytes()) /
+                               std::size_t(options_.max_ctx) * NUM_FULL_VISITS;
   return position * std::size_t(n);
 }
 
-// one 2D copy per cache: NUM_FULL_VISITS rows of n positions, pitch max_ctx positions in the cache, packed in
-// the parked copy (k visits, then v visits)
+// Packed in the parked copy (k visits, then v visits). The eager cache uses two 2D copies.
+// Elastic visits are separate virtual ranges, so each copy touches only mapped rows in one visit.
 void Runtime::save_full_rows(void* dst, int n, cudaMemcpyKind direction) {
   if (full_rows_bytes(n) == 0) return;
   char* p = static_cast<char*>(dst);
+  if (state_.elastic()) {
+    for (bool value : {false, true}) {
+      for (int i = 0; i < NUM_FULL_VISITS; ++i) {
+        const Tensor t = value ? state_.v_full_at(i) : state_.k_full_at(i);
+        const std::size_t bytes = t.bytes() / std::size_t(options_.max_ctx) * std::size_t(n);
+        CUDA_CHECK(cudaMemcpyAsync(p, t.data, bytes, direction, stream_));
+        p += bytes;
+      }
+    }
+    return;
+  }
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
     const std::size_t pitch = t->bytes() / NUM_FULL_VISITS;
     const std::size_t width = (pitch / std::size_t(options_.max_ctx)) * std::size_t(n);
@@ -284,6 +297,18 @@ void Runtime::save_full_rows(void* dst, int n, cudaMemcpyKind direction) {
 void Runtime::restore_full_rows(const void* src, int n, cudaMemcpyKind direction) {
   if (full_rows_bytes(n) == 0) return;
   const char* p = static_cast<const char*>(src);
+  if (state_.elastic()) {
+    state_.ensure_full_rows(n);
+    for (bool value : {false, true}) {
+      for (int i = 0; i < NUM_FULL_VISITS; ++i) {
+        const Tensor t = value ? state_.v_full_at(i) : state_.k_full_at(i);
+        const std::size_t bytes = t.bytes() / std::size_t(options_.max_ctx) * std::size_t(n);
+        CUDA_CHECK(cudaMemcpyAsync(t.data, p, bytes, direction, stream_));
+        p += bytes;
+      }
+    }
+    return;
+  }
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
     const std::size_t pitch = t->bytes() / NUM_FULL_VISITS;
     const std::size_t width = (pitch / std::size_t(options_.max_ctx)) * std::size_t(n);

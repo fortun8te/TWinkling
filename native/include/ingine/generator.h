@@ -76,6 +76,7 @@ struct GenerateStats {
   Reuse reuse = Reuse::None;
   double prefill_seconds = 0, decode_seconds = 0;
   int spec_rounds = 0, spec_accepted = 0;
+  int spec_suffix_rounds = 0, spec_suffix_accepted = 0;
   std::vector<SpecRoundRecord> spec_trace;  // forced replay only
   // Images: tokens of the prompt's images, how many images the vision tower encoded for this request (those
   // not inside the reused prefix) and its time (part of prefill_seconds).
@@ -90,6 +91,8 @@ struct RuntimeOptions {
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
   float spec_threshold = 0.8f;
+  int spec_shortlist_rows = 32768;
+  bool suffix_draft = false;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
   // min(3072, free memory after start-up - 4096), at least 0.
@@ -111,6 +114,7 @@ struct RuntimeOptions {
   int prefill_stage_mib = 0;
   bool prefill_overlap = false;  // overlap the next expert copy with the current visit's non-expert work
   bool kv_v4 = false;  // symmetric INT4 global values, requires FP8 global keys
+  bool elastic_kv = false;  // reserve stable global-KV addresses and map device pages as needed
 };
 
 class Generator {

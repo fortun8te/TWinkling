@@ -116,7 +116,7 @@ def check_code(value):
                    ast.Lambda, ast.arguments, ast.arg, ast.keyword, ast.Tuple, ast.List, ast.Dict,
                    ast.Compare, ast.Eq, ast.NotEq, ast.Gt, ast.Lt, ast.GtE, ast.LtE,
                    ast.And, ast.Or, ast.BoolOp, ast.UnaryOp, ast.USub, ast.Not, ast.Is, ast.IsNot)
-        builtins = {'min': min, 'max': max, 'sorted': sorted}
+        builtins = {'min': min, 'max': max, 'sorted': sorted, 'any': any, 'all': all}
         if len(nodes) > 100 or any(not isinstance(node, allowed) for node in nodes):
             return False
         comprehensions = (ast.ListComp, ast.GeneratorExp)

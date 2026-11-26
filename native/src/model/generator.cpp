@@ -68,7 +68,8 @@ class EngineGenerator final : public Generator {
         host_token_(sizeof(std::int32_t)) {
     if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
     if (options.spec) {
-      drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream());
+      drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream(),
+                                           options.spec_shortlist_rows);
       drafter_->capture();
       taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
       spec_ = std::make_unique<SpecLoop>(rt_, *drafter_);
@@ -122,6 +123,9 @@ class EngineGenerator final : public Generator {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto t = std::chrono::steady_clock::now();
+    // Map the admitted request (including speculative padding) before mutating the live
+    // conversation. A mapping failure leaves its prefix and parked checkpoints intact.
+    rt_.state().ensure_full_rows(n + std::max(0, max_new_tokens) + reserve);
     try {
       prefill(prompt, full_prompt.images, stats);
       stats.prompt_tokens = n;

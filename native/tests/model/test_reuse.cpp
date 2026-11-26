@@ -30,7 +30,8 @@ int main(int argc, char** argv) {
   opt.dense_fp8 = opt.kv_fp8 = opt.spec = true;
   opt.prefill_chunk = 512;
   opt.park_mb = 0;  // the checkpoint tests below see no parked conversations
-  const bool host = argc == 2 && std::string_view(argv[1]) == "--host";
+  const bool elastic = argc == 2 && std::string_view(argv[1]) == "--elastic-host";
+  const bool host = elastic || (argc == 2 && std::string_view(argv[1]) == "--host");
   if (host) {
     if (const char* plan = std::getenv("TWINKLING_TEST_EXPERT_PLAN")) {
       opt.expert_plan = plan;
@@ -39,6 +40,7 @@ int main(int argc, char** argv) {
     }
     opt.park_host_mb = 512;
     opt.kv_v4 = true;
+    opt.elastic_kv = elastic;
   }
   auto gen = make_generator(opt);
 
@@ -49,7 +51,7 @@ int main(int argc, char** argv) {
     for (auto& t : v) t = std::int32_t(1000 + rng.next() % 50000);
     return v;
   };
-  const std::vector<std::int32_t> prompt = random_ids(900), other = random_ids(300);
+  const std::vector<std::int32_t> prompt = random_ids(elastic ? 4300 : 900), other = random_ids(300);
   struct Out {
     std::vector<std::int32_t> tokens;
     GenerateStats stats;

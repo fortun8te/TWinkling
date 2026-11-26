@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "core/vmm.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -122,6 +123,37 @@ void test_buffers() {
     INGINE_CHECK(attrs.type == cudaMemoryTypeHost);
 }
 
+void test_growable_buffer() {
+    int device = 0, supported = 0;
+    INGINE_TEST_CUDA(cudaGetDevice(&device));
+    INGINE_TEST_CUDA(cudaDeviceGetAttribute(&supported, cudaDevAttrVirtualMemoryManagementSupported, device));
+    if (!supported) {
+        std::printf("skip growable buffer: device VMM unavailable\n");
+        return;
+    }
+    const std::size_t cap = std::size_t(64) << 20;
+    ingine::GrowableBuffer buf(cap);
+    const auto address = static_cast<char*>(buf.data());
+    INGINE_CHECK(address && buf.mapped_bytes() == 0);
+    buf.grow(4);
+    const std::size_t first = buf.mapped_bytes();
+    INGINE_CHECK(first >= 4 && first < cap);
+    INGINE_TEST_CUDA(cudaMemset(address, 0x37, 4));
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    buf.grow(first + 4);
+    INGINE_CHECK(buf.data() == address && buf.mapped_bytes() > first);
+    INGINE_TEST_CUDA(cudaMemset(address + first, 0x49, 4));
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+    buf.rollback(first);
+    INGINE_CHECK(buf.data() == address && buf.mapped_bytes() == first);
+    buf.grow(first + 4);
+    INGINE_CHECK(buf.data() == address && buf.mapped_bytes() > first);
+    char before[4]{};
+    INGINE_TEST_CUDA(cudaMemcpy(before, address, sizeof(before), cudaMemcpyDeviceToHost));
+    INGINE_CHECK(std::memcmp(before, "7777", sizeof(before)) == 0);
+    INGINE_CHECK(throws([&] { buf.grow(cap + 1); }));
+}
+
 } // namespace
 
 int main() {
@@ -130,6 +162,7 @@ int main() {
     ingine::DeviceContext ctx(0);
     test_arena();
     test_buffers();
+    test_growable_buffer();
     std::printf("PASS core_arena\n");
     return 0;
 }

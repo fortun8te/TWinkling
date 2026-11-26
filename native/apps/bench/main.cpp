@@ -140,6 +140,8 @@ int main(int argc, char** argv) {
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false, embed_host = false;
   bool kv_v4 = false, prefill_overlap = false;
+  bool suffix_draft = false, elastic_kv = false;
+  int spec_shortlist_rows = 32768;
   int prefill_chunk = 3072, prefill_stage_mib = 0;
   std::string expert_plan;
   double spec_threshold = 0.8, temperature = 0.0;
@@ -157,6 +159,9 @@ int main(int argc, char** argv) {
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
   ap.flag("--kv-v4", "FP8 global keys and compact 4-bit global values (experimental)", &kv_v4);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
+  ap.flag("--suffix-draft", "verified greedy history lookup", &suffix_draft);
+  ap.option("--draft-shortlist", "", "number of ranked DSpark head rows (1..32768)", &spec_shortlist_rows);
+  ap.flag("--elastic-kv", "map full-attention KV pages on demand in device memory", &elastic_kv);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--temperature", "", "", &temperature);
@@ -173,6 +178,10 @@ int main(int argc, char** argv) {
   ap.option("--forced-trace", "", "append every replayed item and round to FILE (JSON lines)", &forced_trace);
   ap.option("--forced-free", "", "with --forced: sample freely from each item's prompt with this seed (no replay)", &forced_free);
   ap.parse(argc, argv);
+  if ((suffix_draft && !spec) || spec_shortlist_rows < 1 || spec_shortlist_rows > 32768) {
+    std::cerr << "ingine-bench: --suffix-draft requires --spec, and --draft-shortlist must be in 1..32768\n";
+    return 2;
+  }
 
   try {
     using Clock = std::chrono::steady_clock;
@@ -187,7 +196,10 @@ int main(int argc, char** argv) {
     options.dense_fp8 = dense_fp8;
     options.kv_fp8 = kv_fp8 || kv_v4;
     options.kv_v4 = kv_v4;
+    options.elastic_kv = elastic_kv;
     options.spec = spec;
+    options.suffix_draft = suffix_draft;
+    options.spec_shortlist_rows = spec_shortlist_rows;
     options.spec_threshold = float(spec_threshold);
     options.prefill_chunk = prefill_chunk;
     options.embed_host = embed_host;

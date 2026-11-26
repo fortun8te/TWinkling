@@ -242,12 +242,16 @@ struct State {
 
   std::vector<DeviceBuffer> storage;
 
+  std::array<GrowableBuffer, NUM_FULL_VISITS> elastic_k, elastic_v;
+
   // per-visit views
   Tensor k_ring_at(int ring) const;
   Tensor v_ring_at(int ring) const;
   std::int64_t* ring_pos_at(int ring) const;
+  bool elastic() const noexcept { return elastic_k.front().data() != nullptr; }
   Tensor k_full_at(int full) const;
   Tensor v_full_at(int full) const;
+  void ensure_full_rows(int rows);
   float* conv_k_at(int v) const { return ptr<float>(conv_k) + std::size_t(v) * 3 * KV_DIM; }
   float* conv_v_at(int v) const { return ptr<float>(conv_v) + std::size_t(v) * 3 * KV_DIM; }
   float* conv_attn_at(int v) const { return ptr<float>(conv_attn) + std::size_t(v) * 3 * HIDDEN; }
