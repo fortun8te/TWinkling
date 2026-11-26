@@ -145,13 +145,19 @@ def main():
                    str(node), str(cli.resolve()), "-p", "--mode", "json", "--no-session",
                    "--no-extensions", "--no-skills", "--no-context-files", "--no-mcp",
                    "--no-prompt-templates", "--tools", "read,edit,write",
-                   "--provider", "local-trial", "--model", args.model, "--thinking", args.thinking, prompt]
+                   "--provider", "local-trial", "--model", args.model, "--thinking", args.thinking]
+        prompt_bytes = prompt.encode("utf-8")
+        if len(prompt_bytes) > 96000:
+            prompt_input = {"input": prompt_bytes}
+        else:
+            command.append(prompt)
+            prompt_input = {"stdin": subprocess.DEVNULL}
         start = time.monotonic()
         timed_out = False
         with trace.open("xb") as stdout, errors.open("xb") as stderr:
             try:
-                status = subprocess.run(command, cwd=repo, env=env, stdin=subprocess.DEVNULL,
-                                        stdout=stdout, stderr=stderr, timeout=args.timeout).returncode
+                status = subprocess.run(command, cwd=repo, env=env, stdout=stdout, stderr=stderr,
+                                        timeout=args.timeout, **prompt_input).returncode
             except subprocess.TimeoutExpired:
                 status, timed_out = None, True
         elapsed = time.monotonic() - start

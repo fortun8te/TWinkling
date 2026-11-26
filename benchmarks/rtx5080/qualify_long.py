@@ -25,6 +25,7 @@ TERMS = (
     'terminal', 'planning', 'invoice', 'workshop', 'scheduling', 'hardware',
     'training', 'documentation', 'labels', 'verification', 'packages', 'routing',
 )
+CASES = ('recall', 'code', 'decode', 'tool', 'chat', 'reasoning')
 CHECKS = (
     ([], None),
     ([{'id': 'a', 'priority': 9, 'status': 'closed'}], None),
@@ -82,6 +83,15 @@ def document(rows, kind, seed, warm=False):
         query = (f'Call lookup_release once with the approved {office} key. '
                  'After receiving the tool result, reply with just its release code, verbatim.')
         return ''.join(lines) + query, {'key': key, 'release': f'RELEASE-{reply}'}
+    if kind == 'chat':
+        query = ('A colleague on their first shift asks how to select a ticket. In plain English, tell them what '
+                 'status qualifies, which priority wins, how to break a tie, and what to do when none qualifies.')
+        return ''.join(lines) + query, 'all four approved ticket rules'
+    if kind == 'reasoning':
+        query = ('Apply all the approved rules to these tickets: gamma (closed, priority 95), theta (open, '
+                 'priority 17), alpha (open, priority 17), beta (open, priority 6), and amber (blocked, priority 99). '
+                 'Return only the selected ticket id.')
+        return ''.join(lines) + query, 'alpha'
     query = ('Write a long incident handover in plain English. Describe concrete investigative steps and tradeoffs '
              'for operations staff. Continue for at least 650 words.')
     if warm:
@@ -304,6 +314,14 @@ def check_answer(kind, reply, expected, output_limit):
                 and len(set(re.findall(r'\b\w+\b', reply['output'].lower()))) >= 60)
     if reply['finish'] != 'stop':
         return False
+    if kind == 'reasoning':
+        return unfence(reply['output']).strip(' \n\t`".').casefold() == expected
+    if kind == 'chat':
+        text = reply['output'].casefold()
+        return (all(term in text for term in ('open', 'priority', 'tie'))
+                and bool(re.search(r'highest|highest-ranked|largest|greatest', text))
+                and bool(re.search(r'smallest|lowest id|alphabetic|lexicograph', text))
+                and bool(re.search(r'\bnone\b|\bno ticket\b|\bnothing\b', text)))
     if kind == 'code':
         return check_code(reply['output']) and reply.get('recall_followup_pass', True)
     try:
@@ -318,7 +336,7 @@ def main():
     parser.add_argument('--model', default='inkling-2-mini-abliterated')
     parser.add_argument('--depth', type=int, action='append', help='allocated window in tokens, repeatable')
     parser.add_argument('--ramp', action='store_true', help='use 16K, 64K, 128K, and 256K when no --depth is given')
-    parser.add_argument('--case', choices=('recall', 'code', 'decode', 'tool'), action='append')
+    parser.add_argument('--case', choices=CASES, action='append')
     parser.add_argument('--follow-recall', action='store_true', help='append exact recall to a coding or tool workflow')
     parser.add_argument('--mode', choices=('cold', 'both'), default='both',
                         help='cold only, or repeat the same document with a changed query')
@@ -368,7 +386,7 @@ def main():
             slope, overhead = calibrations[kind]
             rows = max(64, round((depth - args.headroom - overhead) / slope))
             for repeat in range(args.repeat):
-                seed = args.seed + depth * 13 + ('recall', 'code', 'decode', 'tool').index(kind) * 1000 + repeat
+                seed = args.seed + depth * 13 + CASES.index(kind) * 1000 + repeat
                 for warm in (False, True) if args.mode == 'both' else (False,):
                     prompt, expected = document(rows, kind, seed, warm)
                     rec = {'depth': depth, 'case': kind, 'mode': 'changed_query' if warm else 'cold',
