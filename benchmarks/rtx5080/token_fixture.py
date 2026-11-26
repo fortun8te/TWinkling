@@ -8,10 +8,20 @@ import json
 from pathlib import Path
 import sys
 
-from jinja2 import Environment
+from jinja2 import Environment, nodes
+from jinja2.ext import Extension
 from tokenizers import Tokenizer
 
 from qualify_long import SYSTEM, document
+
+
+class GenerationBlock(Extension):
+    tags = {"generation"}
+
+    def parse(self, parser):
+        line = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return nodes.Scope(body).set_lineno(line)
 
 
 def digest(data):
@@ -63,7 +73,7 @@ def main():
     tokenizer_path = args.model_dir / "tokenizer.json"
     template_path = args.model_dir / "chat_template.jinja"
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
-    environment = Environment(trim_blocks=True, lstrip_blocks=True)
+    environment = Environment(trim_blocks=True, lstrip_blocks=True, extensions=[GenerationBlock])
     template = environment.from_string(template_path.read_text(encoding="utf-8"))
     rows = []
     for count in args.occupied:
@@ -81,6 +91,7 @@ def main():
                      "archive_rows": archive_rows, "canonical_ids_sha256": digest(canonical.tobytes()),
                      "expected": expected, "basalt": basalt.name, "twinkling": twinkling.name})
     manifest = {"seed": args.seed, "effort": args.effort, "task": args.task,
+                "generator_sha256": digest(Path(__file__).read_bytes()),
                 "tokenizer_sha256": digest(tokenizer_path.read_bytes()), "template_sha256": digest(template_path.read_bytes()),
                 "cases": rows}
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
