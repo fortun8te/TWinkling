@@ -122,8 +122,10 @@ def check_code(value):
         if sum(isinstance(node, ast.comprehension) for node in nodes) > 1:
             return False
         for node in nodes:
-            if isinstance(node, ast.Call) and (not isinstance(node.func, ast.Name) or node.func.id not in builtins):
-                return False
+            if isinstance(node, ast.Call):
+                safe_builtin = isinstance(node.func, ast.Name) and node.func.id in builtins
+                if not safe_builtin and not isinstance(node.func, ast.Lambda):
+                    return False
             if isinstance(node, ast.arg) and node.arg.startswith('_'):
                 return False
             if isinstance(node, ast.Name) and node.id.startswith('_'):
