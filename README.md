@@ -49,7 +49,9 @@ The trial used short prompts for decode and a separate 20K-token prefill probe. 
 
 ## Experimental long-context controls
 
-The 5080 launcher defaults to the 64K FP8 profile. Set `TWINKLING_CONTEXT` and use a compatible expert plan when evaluating larger windows. `TWINKLING_KV=v4` keeps FP8 global keys and compresses global values to INT4. `TWINKLING_PREFILL_CHUNK` supports up to 4,096 rows, trading scratch memory for fewer expert transfers. `TWINKLING_PREFILL_OVERLAP=1` overlaps those transfers with attention work. `TWINKLING_PARK_HOST_MIB` sets a pinned host-memory budget for restoring displaced conversations.
+The 5080 launcher defaults to the 64K FP8 profile. Select `TWINKLING_PROFILE=128k` or `TWINKLING_PROFILE=256k` to use the corresponding text-only placement recipe with the original model behavior and all experts retained. A 256K slot reserves capacity and processes the tokens actually sent. Keep a session's prefix identical and append new turns to reuse its checkpoint.
+
+`TWINKLING_KV=v4` keeps FP8 global keys and compresses global values to INT4. `TWINKLING_PREFILL_CHUNK` supports up to 4,096 rows, trading scratch memory for fewer expert transfers. `TWINKLING_PREFILL_OVERLAP=1` overlaps those transfers with attention work. `TWINKLING_PARK_HOST_MIB` sets an optional pinned host-memory budget for restoring displaced conversations.
 
 Use [qualify_long.py](benchmarks/rtx5080/qualify_long.py) against an isolated loopback server to check actual prompt depth, exact recall, coding, and tool round-trips. Test the intended placement and cache precision together and check free VRAM during both load and generation.
 
