@@ -784,32 +784,51 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         };
         // 16-bit offset of 16-byte chunk ch8 of row `key` in a [rows][D] tile, chunks XOR-swizzled by key
         auto roff = [](int key, int ch8) { return key * D + ((ch8 ^ (key & 7)) * 8); };
-        // F8: the V rows of raw slot `slot` to fp16 in wv (exact for E4M3 values)
+        // The V rows of one raw slot widen to FP16 in wv. In V4 each head has a single scale and
+        // sixteen possible outputs, shared by all 128 channels. A half warp expands one key:
+        // every lane computes one rounded value and supplies it to the other lanes by shuffle.
         auto expand_v = [&](const int slot) {
-            constexpr int NCH = KT * (D / 16) / NT;  // 16-byte E4M3 chunks per thread
-            static_assert(NCH * NT == KT * (D / 16), "chunks must divide over the block");
+            const char* tile = raw + slot * RAWB + KT * D;
+            if constexpr (V4) {
+                constexpr int slices = D / 8;  // one packed word and one 16-byte output per lane
+                constexpr int chunks = KT * slices / NT;
+                static_assert(slices == 16 && chunks * NT == KT * slices);
 #pragma unroll
-            for (int n = 0; n < NCH; ++n) {
-                const int i = tid + n * NT, key = i / (D / 16), ch = i % (D / 16);
-                const char* row = raw + slot * RAWB + KT * D + key * D;
-                uint4 r{};
-                if constexpr (!V4) r = *reinterpret_cast<const uint4*>(row + ch * 16);
-                const uint32_t w[4] = {r.x, r.y, r.z, r.w};
-#pragma unroll
-                for (int h = 0; h < 2; ++h) {  // dims 16 ch + 8 h .. + 7
-                    uint32_t o[4];
+                for (int n = 0; n < chunks; ++n) {
+                    const int i = tid + n * NT, key = i / slices, c8 = i % slices;
+                    const char* row = tile + key * D;
+                    const float scale = *reinterpret_cast<const float*>(row + value4::kPackedBytes);
+                    const float value = value4::decode(c8, scale);
+                    const uint32_t entry = __half_as_ushort(__float2half_rn(fabsf(value) <= 65504.f ? value : 0.f));
+                    const uint32_t bits = reinterpret_cast<const uint32_t*>(row)[c8];
+                    uint32_t pairs[4];
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
-                        if constexpr (V4) {
-                            const float scale = *reinterpret_cast<const float*>(row + value4::kPackedBytes);
-                            const auto bits = reinterpret_cast<const uint32_t*>(row)[2 * ch + h] >> (8 * e);
-                            o[e] = half2_of(value4::decode(bits, scale), value4::decode(bits >> 4, scale));
-                        } else {
+                        const uint32_t code = bits >> (8 * e);
+                        const uint32_t low = __shfl_sync(0xffffffffu, entry, int(code & 15u), slices);
+                        const uint32_t high = __shfl_sync(0xffffffffu, entry, int((code >> 4) & 15u), slices);
+                        pairs[e] = low | (high << 16);
+                    }
+                    *reinterpret_cast<uint4*>(wv + roff(key, c8)) = make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
+                }
+            } else {
+                constexpr int chunks = KT * (D / 16) / NT;  // 16-byte E4M3 chunks per thread
+                static_assert(chunks * NT == KT * (D / 16));
+#pragma unroll
+                for (int n = 0; n < chunks; ++n) {
+                    const int i = tid + n * NT, key = i / (D / 16), ch = i % (D / 16);
+                    const uint4 r = *reinterpret_cast<const uint4*>(tile + key * D + ch * 16);
+                    const uint32_t w[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {  // dims 16 ch + 8 h .. + 7
+                        uint32_t o[4];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
                             const float2 f = e4m3x2_f2((w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu);
                             o[e] = half2_of(f.x, f.y);
                         }
+                        *reinterpret_cast<uint4*>(wv + roff(key, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
                     }
-                    *reinterpret_cast<uint4*>(wv + roff(key, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
                 }
             }
         };

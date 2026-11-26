@@ -109,6 +109,14 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint16_t u) {
   return pack_bf16x2(f.x, f.y);
 }
 
+__device__ __forceinline__ uint32_t v4_pair_to_half2(uint32_t bits, float scale) {
+  const float low = float(int(bits & 15u) - 8) * scale;
+  const float high = float(int((bits >> 4) & 15u) - 8) * scale;
+  // The cache rounds through BF16 before P*V consumes FP16. Keep that rounding, packed as a pair.
+  const float2 rounded = __bfloat1622float2(__floats2bfloat162_rn(low, high));
+  return pack_half2(rounded.x, rounded.y);
+}
+
 template <bool FP8, bool EXPLICIT, bool V4 = false>
 __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& r) {
   const int tid = threadIdx.x;
@@ -125,12 +133,10 @@ __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& 
       k1.z = e4m3x2_to_bf16x2(kw[3] & 0xffff); k1.w = e4m3x2_to_bf16x2(kw[3] >> 16);
       if constexpr (V4) {
         const float scale = __uint_as_float(vw[2]);
-        auto pair = [&](uint32_t bits, int shift) {
-          const uint32_t q = bits >> shift;
-          return pack_half2(value4::decode(q, scale), value4::decode(q >> 4, scale));
-        };
-        v0 = make_uint4(pair(vw[0], 0), pair(vw[0], 8), pair(vw[0], 16), pair(vw[0], 24));
-        v1 = make_uint4(pair(vw[1], 0), pair(vw[1], 8), pair(vw[1], 16), pair(vw[1], 24));
+        v0 = make_uint4(v4_pair_to_half2(vw[0], scale), v4_pair_to_half2(vw[0] >> 8, scale),
+                        v4_pair_to_half2(vw[0] >> 16, scale), v4_pair_to_half2(vw[0] >> 24, scale));
+        v1 = make_uint4(v4_pair_to_half2(vw[1], scale), v4_pair_to_half2(vw[1] >> 8, scale),
+                        v4_pair_to_half2(vw[1] >> 16, scale), v4_pair_to_half2(vw[1] >> 24, scale));
       } else {
         v0.x = e4m3x2_to_half2(vw[0] & 0xffff); v0.y = e4m3x2_to_half2(vw[0] >> 16);
         v0.z = e4m3x2_to_half2(vw[1] & 0xffff); v0.w = e4m3x2_to_half2(vw[1] >> 16);
