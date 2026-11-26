@@ -91,6 +91,7 @@ struct RuntimeOptions {
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
   float spec_threshold = 0.8f;
+  bool profile_spec = false;
   int spec_shortlist_rows = 32768;
   bool suffix_draft = false;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another

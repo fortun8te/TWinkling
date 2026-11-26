@@ -188,6 +188,15 @@ void Scheduler::run(Job& job) {
       server_log().info("{}: draft_rounds={} draft_accepted={} suffix_rounds={} suffix_accepted={} native_decode={:.3f}s",
                         job.id, st.spec_rounds, st.spec_accepted, st.spec_suffix_rounds, st.spec_suffix_accepted,
                         st.decode_seconds);
+    if (!st.spec_trace.empty()) {
+      double verify_ms = 0, draft_ms = 0;
+      for (const auto& round : st.spec_trace) {
+        verify_ms += round.verify_ms;
+        draft_ms += round.draft_ms;
+      }
+      server_log().info("{}: spec_profile rounds={} verify_total_ms={:.3f} draft_total_ms={:.3f}",
+                        job.id, st.spec_trace.size(), verify_ms, draft_ms);
+    }
     if (!job.images.empty()) {  // images: all of the prompt, those the vision tower encoded now, its time
       server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job.id, job.images.size(),
                         st.image_tokens, st.images_encoded, st.vision_seconds);

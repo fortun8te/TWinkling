@@ -164,7 +164,8 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
   std::vector<std::int32_t> out{token};
   // the last verify call (none before the first round): its position, width and accepted drafts
   int round_P = -1, round_m = 0, round_acc = 0;
-  // forced replay: per round, events around the verify + acceptance and around the next draft
+  // Per-round events are recorded only during forced replay or explicit diagnostic runs.
+  const bool trace_rounds = forced || rt_.options().profile_spec;
   struct RoundEvents {
     cudaEvent_t e[3];
   };
@@ -232,6 +233,8 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
       auto* w = static_cast<std::int32_t*>(forced_window_.data());
       for (int i = 0; i < kd::BLOCK; ++i)
         w[i] = std::size_t(emitted + i) < sampling.forced.size() ? sampling.forced[emitted + i] : 0;
+    }
+    if (trace_rounds) {
       events.emplace_back();
       record_event(0);
     }
@@ -240,12 +243,12 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     (suffix_hit ? suffix_accept_ : accept_).launch(stream);
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);
     CUDA_CHECK(cudaEventRecord(done_, stream));
-    if (forced) record_event(1);
+    if (trace_rounds) record_event(1);
     // A cold lookup path goes back to the normal pipelined DSpark path
     // during a pause. Only the next active lookup needs a host decision.
     draft_ready = !lookup_enabled || rounds + 1 < try_suffix_after;
     if (draft_ready) drafter_.advance(P);
-    if (forced) record_event(2);
+    if (trace_rounds) record_event(2);
     CUDA_CHECK(cudaEventSynchronize(done_));  // the round's only host synchronisation
     VerifyRecord r;
     std::memcpy(&r, record, sizeof r);
@@ -254,9 +257,9 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     round_P = P;
     round_m = r.m;
     round_acc = acc;
-    if (forced) {  // the run all 7 drafts would have reached
+    if (trace_rounds) {
       int all = 0;
-      while (all < kd::GAMMA && std::size_t(emitted + all) < sampling.forced.size() &&
+      while (forced && all < kd::GAMMA && std::size_t(emitted + all) < sampling.forced.size() &&
              r.drafts[all] == sampling.forced[emitted + all])
         ++all;
       stats.spec_trace.push_back({r.m, acc, all, 0.f, 0.f});
@@ -282,7 +285,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     out.assign(r.drafts, r.drafts + acc);
     out.push_back(r.next);
   }
-  if (forced) {
+  if (trace_rounds) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
     for (std::size_t i = 0; i < events.size(); ++i) {
       if (i < stats.spec_trace.size()) {

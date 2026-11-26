@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
   std::string expert_plan;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   bool kv_v4 = false, prefill_overlap = false;
-  bool suffix_draft = false, elastic_kv = false;
+  bool suffix_draft = false, elastic_kv = false, profile_spec = false;
   int spec_shortlist_rows = 32768;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--suffix-draft", "look up exact history continuations during greedy speculative decoding", &suffix_draft);
+  ap.flag("--profile-spec", "measure verify and draft phases with CUDA events", &profile_spec);
   ap.option("--draft-shortlist", "", "number of ranked DSpark head rows (1..32768)", &spec_shortlist_rows);
   ap.flag("--elastic-kv", "map full-attention KV pages on demand in device memory", &elastic_kv);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
@@ -178,6 +179,7 @@ int main(int argc, char** argv) {
       options.elastic_kv = elastic_kv;
       options.spec = spec;
       options.suffix_draft = suffix_draft;
+      options.profile_spec = profile_spec;
       options.spec_shortlist_rows = spec_shortlist_rows;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
