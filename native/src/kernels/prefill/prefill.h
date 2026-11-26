@@ -16,7 +16,7 @@ inline constexpr int kHeads = 24, kKvHeads = 8, kHeadDim = 128, kRel = 16, kRelE
 inline constexpr int kKvDim = kKvHeads * kHeadDim;  // 1024
 inline constexpr int kInter = 1152, kExperts = 128, kTopK = 8;
 inline constexpr int kAttnKeyTile = 64;    // keys per attention tile (tile bounds granularity)
-inline constexpr int kAttnMaxTiles = 64;   // explicit-position key tiles per call (ring + chunk)
+inline constexpr int kAttnMaxTiles = 80;   // 1,024 ring rows plus up to 4,096 prompt rows
 
 // ------------------------------------------------------------------------------------------------- GEMM
 
@@ -69,6 +69,7 @@ struct AttnPrepParams {
   void* k_out = nullptr;           // out [T, 8, 128] rows: bf16, or fp8 e4m3 (out_fp8: full caches with kv_fp8)
   void* v_out = nullptr;
   bool out_fp8 = false;
+  bool out_v4 = false;
 };
 // model._qkv per token: q (scale, clip, tau, BF16), rel (scale, clip, tau, BF16), keys/values through the
 // static (sliding) or dynamic (full) conv, BF16, key clip / value RMS norm, stored at the cache precision.
@@ -83,6 +84,7 @@ struct AttnParams {
   const void* k = nullptr;           // key rows [L, 8, 128]: bf16, or fp8 e4m3 (kv_fp8)
   const void* v = nullptr;
   bool kv_fp8 = false;
+  bool kv_v4 = false;
   const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at j
   const int4* bounds = nullptr;      // key_tile_bounds of kpos (with kpos)
   int L = 0;

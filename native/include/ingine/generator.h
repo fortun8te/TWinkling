@@ -86,8 +86,7 @@ struct GenerateStats {
 struct RuntimeOptions {
   std::filesystem::path model_dir, ablation;  // empty ablation: original model
   int max_ctx = 65536;
-  // Tokens per prefill chunk. 3072 (the largest the sliding attention takes) reads a long prompt 6-10% faster
-  // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
+  // Tokens per prefill chunk. Larger chunks stage experts fewer times and use more scratch.
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
   float spec_threshold = 0.8f;
@@ -95,6 +94,8 @@ struct RuntimeOptions {
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
   // min(3072, free memory after start-up - 4096), at least 0.
   int park_mb = -1;
+  // Optional host-backed checkpoint budget. A positive value uses host RAM in place of device parking.
+  int park_host_mb = 0;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
   // RTX 5080 port. embed_host: the token embedding table (0.93 GB BF16) stays in mapped pinned host memory;
@@ -108,6 +109,8 @@ struct RuntimeOptions {
   // VRAM (MiB) the prefill uses to stage a visit's host-resident experts (prompts read at device bandwidth
   // instead of over PCIe); 0: off.
   int prefill_stage_mib = 0;
+  bool prefill_overlap = false;  // overlap the next expert copy with the current visit's non-expert work
+  bool kv_v4 = false;  // symmetric INT4 global values, requires FP8 global keys
 };
 
 class Generator {

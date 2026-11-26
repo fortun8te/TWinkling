@@ -47,6 +47,12 @@ On one 16 GB RTX 5080 at a 280 W power limit, the installed eight-block build de
 
 The trial used short prompts for decode and a separate 20K-token prefill probe. The four-block candidate gained about 2% on the code fixture, with a different speculative acceptance rate. TWinkling retains the eight-block kernel. See the [setup, limits, and reproduction commands](benchmarks/rtx5080/README.md) and [individual measurements](benchmarks/rtx5080/measurements.json).
 
+## Experimental long-context controls
+
+The 5080 launcher defaults to the 64K FP8 profile. Set `TWINKLING_CONTEXT` and use a compatible expert plan when evaluating larger windows. `TWINKLING_KV=v4` keeps FP8 global keys and compresses global values to INT4. `TWINKLING_PREFILL_CHUNK` supports up to 4,096 rows, trading scratch memory for fewer expert transfers. `TWINKLING_PREFILL_OVERLAP=1` overlaps those transfers with attention work. `TWINKLING_PARK_HOST_MIB` sets a pinned host-memory budget for restoring displaced conversations.
+
+Use [qualify_long.py](benchmarks/rtx5080/qualify_long.py) against an isolated loopback server to check actual prompt depth, exact recall, coding, and tool round-trips. Test the intended placement and cache precision together and check free VRAM during both load and generation.
+
 ## Source and license
 
 TWinkling keeps ingine’s Apache-2.0 engine and third-party notices. The RTX 5080 branch adds the SM120a port, expert placement and requantization, and staged prefill. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The full checkpoint is fetched from the upstream [model pack](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine). The base [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) model is by Thinking Machines Lab.

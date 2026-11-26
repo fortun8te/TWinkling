@@ -2,6 +2,7 @@
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "kernels/common/value4.h"
 
 #include <stdexcept>
 
@@ -30,23 +31,31 @@ Tensor State::k_full_at(int full) const {
   return rm(ptr<char>(k_full) + std::size_t(full) * max_ctx * KV_DIM * es, k_full.dtype, {max_ctx, KV_HEADS, HEAD_DIM});
 }
 Tensor State::v_full_at(int full) const {
+  if (kv_v4) {
+    constexpr int bytes = kernels::value4::kHeadBytes;
+    return rm(ptr<char>(v_full) + std::size_t(full) * max_ctx * KV_HEADS * bytes, DType::U8,
+              {max_ctx, KV_HEADS, bytes});
+  }
   const std::size_t es = kv_fp8 ? 1 : 2;
   return rm(ptr<char>(v_full) + std::size_t(full) * max_ctx * KV_DIM * es, v_full.dtype, {max_ctx, KV_HEADS, HEAD_DIM});
 }
 
-State make_state(int max_ctx, bool kv_fp8) {
+State make_state(int max_ctx, bool kv_fp8, bool kv_v4) {
+  if (kv_v4 && !kv_fp8) throw std::invalid_argument("INT4 global values require FP8 global keys");
   // the attention kernel keeps positions in int32 and caps full caches at 2^30 rows
   if (max_ctx < 1 || max_ctx > (1 << 30)) throw std::invalid_argument("max_ctx must be in 1..2^30");
   State st;
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
+  st.kv_v4 = kv_v4;
   const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
   st.k_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.v_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
   st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
-  st.v_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
+  st.v_full = kv_v4 ? zeros(st.storage, DType::U8, {NUM_FULL_VISITS, max_ctx, KV_HEADS, kernels::value4::kHeadBytes})
+                    : zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
   st.conv_k = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
   st.conv_v = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
   st.conv_attn = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});

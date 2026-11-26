@@ -156,14 +156,15 @@ struct UploadOptions {
 struct UploadStats {
     std::uint64_t bytes = 0;
     double seconds      = 0;
+    std::size_t read_calls = 0;
     [[nodiscard]] double gib_per_second() const noexcept {
         return seconds > 0 ? double(bytes) / double(1ull << 30) / seconds : 0.0;
     }
 };
 
 // Uploads file ranges to device memory. Reader threads pread chunks into pinned staging buffers and
-// enqueue each chunk's cudaMemcpyAsync as soon as it is read, so disk/page-cache reads, the copies of
-// other chunks and further reads overlap. Owns the pinned staging memory (chunk_bytes *
+// enqueue each chunk's CUDA copies as soon as it is read. Adjacent file ranges can share a read and a staging
+// completion event even if their device destinations differ. Owns the pinned staging memory (chunk_bytes *
 // staging_buffers) and the reader threads for its lifetime: create one for a whole model load.
 class DeviceUploader {
 public:
@@ -181,11 +182,16 @@ public:
     [[nodiscard]] const UploadOptions& options() const noexcept { return options_; }
 
 private:
+    struct Slice {
+        std::byte* dst;
+        std::uint64_t bytes;
+    };
     struct Chunk {
         const SafetensorsFile* file;
         std::uint64_t offset;
         std::uint64_t bytes;
-        void* dst;
+        std::size_t first_slice;
+        std::size_t slice_count;
     };
     struct Slot {
         std::byte* host    = nullptr;
@@ -215,6 +221,7 @@ private:
     bool stopping_            = false;
     int active_workers_       = 0;
     std::vector<Chunk> chunks_;
+    std::vector<Slice> slices_;
     std::size_t next_chunk_ = 0;
     cudaStream_t stream_    = nullptr;
     int device_             = 0; // CUDA device current at construction (owns the events)

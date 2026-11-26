@@ -13,9 +13,11 @@
 #include "kernels/dense/dense.h"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -79,8 +81,17 @@ class Loader {
     const std::uint64_t eb = ref->bytes / EXPERTS;
     tiered_->emplace_back(std::size_t(eb) * keep, std::size_t(eb) * hot);
     auto* base = static_cast<std::byte*>(tiered_->back().data());
-    for (int j = 0; j < keep; ++j)
-      pending_.push_back(UploadRequest{ref.file, ref->offset + std::uint64_t(order[j]) * eb, eb, base + std::size_t(j) * eb});
+    // Read in checkpoint order so adjacent experts can share a staged read. The inverse mapping
+    // keeps the original hot/cold order in the CUDA allocation, including plans that omit experts.
+    std::array<int, EXPERTS> destination;
+    destination.fill(-1);
+    for (int j = 0; j < keep; ++j) destination[order[j]] = j;
+    for (int expert = 0; expert < EXPERTS; ++expert) {
+      const int j = destination[expert];
+      if (j < 0) continue;
+      pending_.push_back(UploadRequest{ref.file, ref->offset + std::uint64_t(expert) * eb,
+                                       eb, base + std::size_t(j) * eb});
+    }
     return ref->view(base);
   }
 
@@ -125,12 +136,14 @@ class Loader {
   }
 
   void flush() {
-    if (!pending_.empty()) up_.upload(pending_, stream_);
+    if (pending_.empty()) return;
+    upload_reads_ += up_.upload(pending_, stream_).read_calls;
     pending_.clear();
   }
 
   const SafetensorsModel& model() const { return m_; }
   cudaStream_t stream() const { return stream_; }
+  std::size_t upload_reads() const { return upload_reads_; }
 
  private:
   const SafetensorsModel& m_;
@@ -139,6 +152,7 @@ class Loader {
   std::vector<DeviceBuffer>& storage_;
   std::vector<TieredBuffer>* tiered_;
   std::vector<UploadRequest> pending_;
+  std::size_t upload_reads_ = 0;
 };
 
 // Placement of one layer's routed experts (WeightOptions::expert_plan).
@@ -422,7 +436,10 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
 }
 
 Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream, const WeightOptions& placement) {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
   const SafetensorsModel m(model_dir);
+  const auto indexed = Clock::now();
   DeviceUploader up;
   Weights w;
   w.dense_fp8 = dense_fp8;
@@ -438,6 +455,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     w.experts_keep[l] = plan[l].keep;
   }
 
+  const auto layers_ready = Clock::now();
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
   {
@@ -465,6 +483,8 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
   w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});
   w.final_norm = ld.f32("model.llm.norm.weight", {H});
+  const auto embeddings_ready = Clock::now();
+  std::size_t head_reads = 0;
   {
     const std::string name = "model.llm.unembed.weight";
     const SafetensorsRef ref = m.at(name);
@@ -480,7 +500,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
       for (int r0 = 0; r0 < UNPADDED_VOCAB; r0 += kPiece) {
         const int n = std::min(kPiece, UNPADDED_VOCAB - r0);
         const UploadRequest req{ref.file, ref->offset + std::uint64_t(r0) * row_bytes, std::uint64_t(n) * row_bytes, tmp.p};
-        up.upload(std::span<const UploadRequest>(&req, 1), stream);
+        head_reads += up.upload(std::span<const UploadRequest>(&req, 1), stream).read_calls;
         kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(tmp.p), n, H,
                                  static_cast<std::uint8_t*>(q) + std::size_t(r0) * H, sc + r0, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));  // before tmp is reused
@@ -494,6 +514,13 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
+  const auto ready = Clock::now();
+  const auto ms = [](auto elapsed) { return std::chrono::duration<double, std::milli>(elapsed).count(); };
+  spdlog::info("weights loaded in {:.0f} ms (index {:.0f}, layers {:.0f}, embeddings {:.0f}, LM head {:.0f}; "
+               "{} staged read ranges)",
+               ms(ready - start), ms(indexed - start), ms(layers_ready - indexed),
+               ms(embeddings_ready - layers_ready), ms(ready - embeddings_ready),
+               ld.upload_reads() + head_reads);
   return w;
 }
 

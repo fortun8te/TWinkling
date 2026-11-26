@@ -79,6 +79,7 @@
 #include "kernels/attn/attn.h"
 
 #include "kernels/common/l2.cuh"
+#include "kernels/common/value4.cuh"
 
 #include "core/device.h"
 

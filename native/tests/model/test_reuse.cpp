@@ -9,13 +9,15 @@
 #include "ingine/generator.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ingine::model;
 
-int main() {
+int main(int argc, char** argv) {
   if (ingine::test::skip_without_gpu()) return ingine::test::kSkip;
   const std::filesystem::path dir = INGINE_MODEL_DIR;
   if (!std::filesystem::exists(dir / "mtp.safetensors")) {
@@ -28,6 +30,16 @@ int main() {
   opt.dense_fp8 = opt.kv_fp8 = opt.spec = true;
   opt.prefill_chunk = 512;
   opt.park_mb = 0;  // the checkpoint tests below see no parked conversations
+  const bool host = argc == 2 && std::string_view(argv[1]) == "--host";
+  if (host) {
+    if (const char* plan = std::getenv("TWINKLING_TEST_EXPERT_PLAN")) {
+      opt.expert_plan = plan;
+      opt.embed_host = true;
+      opt.prefill_stage_mib = 256;
+    }
+    opt.park_host_mb = 512;
+    opt.kv_v4 = true;
+  }
   auto gen = make_generator(opt);
 
   ingine::test::Rng rng(3);
@@ -53,6 +65,20 @@ int main() {
   bool ok = true;
   Sampling greedy;
   greedy.temperature = 0.f;
+  if (host) {
+    auto follow = prompt;
+    const auto suffix = random_ids(32);
+    follow.insert(follow.end(), suffix.begin(), suffix.end());
+    run(prompt, 0, greedy);
+    const Out before = run(follow, 32, greedy);
+    run(other, 4, greedy);
+    const Out after = run(follow, 32, greedy);
+    const bool good = after.stats.reuse == Reuse::Parked && after.stats.reused_tokens == int(follow.size()) &&
+                      after.tokens.size() == 32 && after.tokens == before.tokens;
+    std::printf("%s host checkpoint with compact KV: %s, %d reused, %zu output tokens\n", good ? "PASS" : "FAIL",
+                to_string(after.stats.reuse), after.stats.reused_tokens, after.tokens.size());
+    return good ? 0 : 1;
+  }
   Sampling sampled;
   sampled.temperature = 1.f;
   sampled.seed = 5;

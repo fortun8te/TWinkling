@@ -67,10 +67,12 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1, prefill_chunk = 3072;
+  int park_host_mb = 0;
   bool embed_host = false;
   int prefill_stage_mib = 0;
   std::string expert_plan;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
+  bool kv_v4 = false, prefill_overlap = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -91,19 +93,23 @@ int main(int argc, char** argv) {
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
+  ap.flag("--kv-v4", "FP8 global keys and compact 4-bit global values (experimental)", &kv_v4);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-mb", "",
             "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
             "0 = off (default: min(3072, free memory after start-up - 4096))",
             &park_mb);
-  ap.option("--prefill-chunk", "", "tokens per prefill chunk (1..3072; less scratch memory, slower long prompts)",
+  ap.option("--park-host-mb", "", "pinned host RAM (MiB) for displaced conversation checkpoints (0: off)",
+            &park_host_mb);
+  ap.option("--prefill-chunk", "", "tokens per prefill chunk (1..4096; larger chunks use more scratch)",
             &prefill_chunk);
   ap.flag("--embed-host", "keep the token embedding table (0.93 GB) in pinned host memory (RTX 5080 port)", &embed_host);
   ap.option("--expert-plan", "", "routed-expert placement JSON: hot (VRAM), host-tier and pruned experts per layer",
             &expert_plan);
   ap.option("--prefill-stage-mib", "", "VRAM (MiB) to stage host-resident experts during long prefills (0: off)",
             &prefill_stage_mib);
+  ap.flag("--prefill-overlap", "overlap staged expert copies with each visit's attention", &prefill_overlap);
   ap.flag("--no-vision", "text only: do not load the vision tower (saves 0.6 GB) and reject requests with images",
           &no_vision);
   ap.option("--image-max-tokens", "",
@@ -123,6 +129,10 @@ int main(int argc, char** argv) {
   ap.option("--top-k", "", "top_k of requests that omit it, 0 = off (default: generation_config.json, else 0)",
             &top_k);
   ap.parse(argc, argv);
+  if (park_host_mb < 0) {
+    std::cerr << "ingine-serve: error: --park-host-mb must be at least 0\n";
+    return 2;
+  }
   if (image_max_tokens < 1 || image_max_tokens > ingine::image::MAX_TOKENS || max_images < 0 || max_image_tokens < 0) {
     std::cerr << "ingine-serve: error: --image-max-tokens must be in [1, " << ingine::image::MAX_TOKENS
               << "] and --max-images, --max-image-tokens at least 0\n";
@@ -154,15 +164,18 @@ int main(int argc, char** argv) {
       options.ablation = ablation;
       options.max_ctx = max_ctx;
       options.dense_fp8 = dense_fp8;
-      options.kv_fp8 = kv_fp8;
+      options.kv_fp8 = kv_fp8 || kv_v4;
+      options.kv_v4 = kv_v4;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
+      options.park_host_mb = park_host_mb;
       options.vision = !no_vision;
       options.prefill_chunk = prefill_chunk;
       options.embed_host = embed_host;
       options.expert_plan = expert_plan;
       options.prefill_stage_mib = prefill_stage_mib;
+      options.prefill_overlap = prefill_overlap;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

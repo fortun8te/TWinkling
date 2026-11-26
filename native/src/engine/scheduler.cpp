@@ -184,6 +184,9 @@ void Scheduler::run(Job& job) {
     // prefix reuse of the prompt: the path, the tokens reused and prefilled, the prefill time
     server_log().info("{}: reuse={} reused={} prefilled={} prefill={:.3f}s", job.id, model::to_string(st.reuse),
                       st.reused_tokens, st.prompt_tokens - st.reused_tokens, st.prefill_seconds);
+    if (st.spec_rounds)
+      server_log().info("{}: draft_rounds={} draft_accepted={} native_decode={:.3f}s", job.id, st.spec_rounds,
+                        st.spec_accepted, st.decode_seconds);
     if (!job.images.empty()) {  // images: all of the prompt, those the vision tower encoded now, its time
       server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job.id, job.images.size(),
                         st.image_tokens, st.images_encoded, st.vision_seconds);

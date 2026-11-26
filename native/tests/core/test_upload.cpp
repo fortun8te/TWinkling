@@ -83,8 +83,28 @@ void round_trip(const std::filesystem::path& dir, cudaStream_t stream) {
         if (round == 0) { dev.fill(0); }
     }
 
-    // A raw range spanning two tensors' data.
     const auto& a = file.at("a.bf16");
+    // A contiguous source run copied into separately positioned destinations with a gap in the file.
+    DeviceBuffer scattered(13);
+    scattered.fill(0);
+    auto* scatter_dst = static_cast<std::byte*>(scattered.p);
+    const UploadRequest scatter[] = {
+        {&file, a.offset + 11, 3, scatter_dst + 4},
+        {&file, a.offset + 14, 2, scatter_dst},
+        {&file, a.offset + 19, 5, scatter_dst + 8},
+    };
+    const auto scatter_stats = up.upload(scatter, stream);
+    INGINE_CHECK(scatter_stats.bytes == 10);
+    INGINE_CHECK(scatter_stats.read_calls == 2);
+    std::vector<std::byte> scattered_bytes(13);
+    scattered.copy_to_host(scattered_bytes.data(), scattered_bytes.size());
+    std::vector<std::byte> scatter_expected(13);
+    file.read_range(a.offset + 11, 3, scatter_expected.data() + 4);
+    file.read_range(a.offset + 14, 2, scatter_expected.data());
+    file.read_range(a.offset + 19, 5, scatter_expected.data() + 8);
+    INGINE_CHECK(scattered_bytes == scatter_expected);
+
+    // A raw range spanning two tensors' data.
     std::vector<std::uint8_t> expect(a.bytes + 1000);
     file.read_range(a.offset, expect.size(), expect.data());
     DeviceBuffer dev2(expect.size());

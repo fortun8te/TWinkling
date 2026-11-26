@@ -17,6 +17,7 @@
 // position j: the full-attention cache prefix) or explicit (kpos, the sliding ring + chunk rows) with per-tile
 // position bounds deciding which tiles are skipped, need no mask, or need the bias. CTAs run heaviest row tiles
 // (latest tokens) first.
+#include "kernels/common/value4.cuh"
 #include "kernels/prefill/common.cuh"
 #include "kernels/prefill/prefill.h"
 
@@ -30,6 +31,7 @@ constexpr int D = kHeadDim;   // 128
 constexpr int DCH = D / 8;    // 16-byte chunks per 16-bit row
 constexpr int BK = kAttnKeyTile;
 constexpr int NWARPS = 8, NT = NWARPS * 32, BR = NWARPS * 16;  // 128 query rows per CTA
+static_assert(kAttnMaxTiles <= NT);
 constexpr int GQA = kHeads / kKvHeads;
 constexpr int GATE_COL = kHeads * kHeadDim;                       // 3072
 constexpr int SINK_COL = 2 * kHeads * kHeadDim + kHeads * kRel;   // 6528
@@ -54,7 +56,7 @@ struct KvRegs {
   int kp;
 };
 
-template <bool FP8, bool EXPLICIT>
+template <bool FP8, bool EXPLICIT, bool V4 = false>
 __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, KvRegs<FP8>& r) {
   const int tid = threadIdx.x;
   if constexpr (FP8) {
@@ -67,7 +69,14 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
       if (j < p.L) {
         const size_t off = size_t(j) * kKvDim + g * D + c * 16;
         r.k[i] = __ldg(reinterpret_cast<const uint4*>(K + off));
-        r.v[i] = __ldg(reinterpret_cast<const uint4*>(V + off));
+        if constexpr (V4) {
+          const auto v = value4::head(static_cast<const char*>(p.v), size_t(j) * kKvHeads + g);
+          const uint2 bits = __ldg(reinterpret_cast<const uint2*>(v.packed) + c);
+          const auto scale = __ldg(reinterpret_cast<const uint32_t*>(v.scale));
+          r.v[i] = make_uint4(bits.x, bits.y, scale, 0);
+        } else {
+          r.v[i] = __ldg(reinterpret_cast<const uint4*>(&V[off]));
+        }
       } else {
         r.k[i] = r.v[i] = make_uint4(0, 0, 0, 0);
       }
@@ -100,7 +109,7 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint16_t u) {
   return pack_bf16x2(f.x, f.y);
 }
 
-template <bool FP8, bool EXPLICIT>
+template <bool FP8, bool EXPLICIT, bool V4 = false>
 __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& r) {
   const int tid = threadIdx.x;
   if constexpr (FP8) {
@@ -114,10 +123,20 @@ __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& 
       k0.z = e4m3x2_to_bf16x2(kw[1] & 0xffff); k0.w = e4m3x2_to_bf16x2(kw[1] >> 16);
       k1.x = e4m3x2_to_bf16x2(kw[2] & 0xffff); k1.y = e4m3x2_to_bf16x2(kw[2] >> 16);
       k1.z = e4m3x2_to_bf16x2(kw[3] & 0xffff); k1.w = e4m3x2_to_bf16x2(kw[3] >> 16);
-      v0.x = e4m3x2_to_half2(vw[0] & 0xffff); v0.y = e4m3x2_to_half2(vw[0] >> 16);
-      v0.z = e4m3x2_to_half2(vw[1] & 0xffff); v0.w = e4m3x2_to_half2(vw[1] >> 16);
-      v1.x = e4m3x2_to_half2(vw[2] & 0xffff); v1.y = e4m3x2_to_half2(vw[2] >> 16);
-      v1.z = e4m3x2_to_half2(vw[3] & 0xffff); v1.w = e4m3x2_to_half2(vw[3] >> 16);
+      if constexpr (V4) {
+        const float scale = __uint_as_float(vw[2]);
+        auto pair = [&](uint32_t bits, int shift) {
+          const uint32_t q = bits >> shift;
+          return pack_half2(value4::decode(q, scale), value4::decode(q >> 4, scale));
+        };
+        v0 = make_uint4(pair(vw[0], 0), pair(vw[0], 8), pair(vw[0], 16), pair(vw[0], 24));
+        v1 = make_uint4(pair(vw[1], 0), pair(vw[1], 8), pair(vw[1], 16), pair(vw[1], 24));
+      } else {
+        v0.x = e4m3x2_to_half2(vw[0] & 0xffff); v0.y = e4m3x2_to_half2(vw[0] >> 16);
+        v0.z = e4m3x2_to_half2(vw[1] & 0xffff); v0.w = e4m3x2_to_half2(vw[1] >> 16);
+        v1.x = e4m3x2_to_half2(vw[2] & 0xffff); v1.y = e4m3x2_to_half2(vw[2] >> 16);
+        v1.z = e4m3x2_to_half2(vw[3] & 0xffff); v1.w = e4m3x2_to_half2(vw[3] >> 16);
+      }
       *reinterpret_cast<uint4*>(&s.k[buf][swz<DCH>(row, 2 * c)]) = k0;
       *reinterpret_cast<uint4*>(&s.k[buf][swz<DCH>(row, 2 * c + 1)]) = k1;
       *reinterpret_cast<uint4*>(&s.v[buf][swz<DCH>(row, 2 * c)]) = v0;
@@ -141,7 +160,7 @@ __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& 
   }
 }
 
-template <bool FP8, bool EXPLICIT>
+template <bool FP8, bool EXPLICIT, bool V4 = false>
 __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
   Smem& s = *reinterpret_cast<Smem*>(smem_raw);
@@ -216,15 +235,15 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 
   KvRegs<FP8> regs;
   if (ntiles > 0) {
-    load_tile<FP8, EXPLICIT>(p, g, tile_at(0) * BK, regs);
-    store_tile<FP8, EXPLICIT>(s, 0, regs);
+    load_tile<FP8, EXPLICIT, V4>(p, g, tile_at(0) * BK, regs);
+    store_tile<FP8, EXPLICIT, V4>(s, 0, regs);
   }
   __syncthreads();
 
 #pragma unroll 1
   for (int i = 0; i < ntiles; ++i) {
     const int kt = tile_at(i), buf = i & 1;
-    if (i + 1 < ntiles) load_tile<FP8, EXPLICIT>(p, g, tile_at(i + 1) * BK, regs);
+    if (i + 1 < ntiles) load_tile<FP8, EXPLICIT, V4>(p, g, tile_at(i + 1) * BK, regs);
 
     // tile class (uniform over the CTA)
     int kmin, kmax;
@@ -263,7 +282,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     }
     // stage the next tile now (its buffer was last read before the previous barrier): the conversion and the
     // shared stores overlap the Q.K^T MMAs in flight instead of trailing the P.V MMAs
-    if (i + 1 < ntiles) store_tile<FP8, EXPLICIT>(s, buf ^ 1, regs);
+    if (i + 1 < ntiles) store_tile<FP8, EXPLICIT, V4>(s, buf ^ 1, regs);
 
     // ---- scores (log2 units), bias, mask
     float rmax[2] = {m[0], m[1]};
@@ -364,13 +383,13 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   }
 }
 
-template <bool FP8, bool EXPLICIT>
+template <bool FP8, bool EXPLICIT, bool V4 = false>
 void launch(const AttnParams& p, cudaStream_t stream) {
   static const cudaError_t attr =
-      cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem)));
+      cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT, V4>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem)));
   if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
   const dim3 grid((GQA * p.T + BR - 1) / BR, kKvHeads);
-  attn_kernel<FP8, EXPLICIT><<<grid, NT, sizeof(Smem), stream>>>(p);
+  attn_kernel<FP8, EXPLICIT, V4><<<grid, NT, sizeof(Smem), stream>>>(p);
 }
 
 // ---- sliding-visit key rows
@@ -427,8 +446,12 @@ void attention(const AttnParams& p, cudaStream_t stream) {
     throw std::invalid_argument("prefill attention: missing argument");
   const bool expl = p.kpos != nullptr;
   if (expl && (!p.bounds || (p.L + BK - 1) / BK > kAttnMaxTiles))
-    throw std::invalid_argument("prefill attention: explicit keys need bounds and at most 64 tiles");
-  if (p.kv_fp8) {
+    throw std::invalid_argument("prefill attention: explicit key tiles exceed the bounded layout or lack bounds");
+  if (p.kv_v4) {
+    if (!p.kv_fp8 || expl || p.window != 0)
+      throw std::invalid_argument("prefill attention: INT4 values require FP8 keys on a full visit");
+    launch<true, false, true>(p, stream);
+  } else if (p.kv_fp8) {
     if (expl) launch<true, true>(p, stream);
     else launch<true, false>(p, stream);
   } else {

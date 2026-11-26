@@ -139,6 +139,7 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false, embed_host = false;
+  bool kv_v4 = false, prefill_overlap = false;
   int prefill_chunk = 3072, prefill_stage_mib = 0;
   std::string expert_plan;
   double spec_threshold = 0.8, temperature = 0.0;
@@ -154,6 +155,7 @@ int main(int argc, char** argv) {
   ap.option("--effort", "", "", &effort);
   ap.flag("--dense-fp8", "", &dense_fp8);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
+  ap.flag("--kv-v4", "FP8 global keys and compact 4-bit global values (experimental)", &kv_v4);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
@@ -162,6 +164,7 @@ int main(int argc, char** argv) {
   ap.flag("--embed-host", "token embedding in pinned host memory", &embed_host);
   ap.option("--expert-plan", "", "routed-expert placement JSON", &expert_plan);
   ap.option("--prefill-stage-mib", "", "VRAM to stage host experts during prefill", &prefill_stage_mib);
+  ap.flag("--prefill-overlap", "overlap staged expert copies with each visit's attention", &prefill_overlap);
   ap.option("--long-prompt", "", "also time prefill of a synthetic prompt of N tokens", &long_prompt);
   ap.option("--forced", "", "teacher-forced replay of the outputs in FILE (JSON lines {name, prompt, output})",
             &forced);
@@ -182,13 +185,15 @@ int main(int argc, char** argv) {
     options.ablation = ablation;
     options.max_ctx = max_ctx;
     options.dense_fp8 = dense_fp8;
-    options.kv_fp8 = kv_fp8;
+    options.kv_fp8 = kv_fp8 || kv_v4;
+    options.kv_v4 = kv_v4;
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
     options.prefill_chunk = prefill_chunk;
     options.embed_host = embed_host;
     options.expert_plan = expert_plan;
     options.prefill_stage_mib = prefill_stage_mib;
+    options.prefill_overlap = prefill_overlap;
     auto gen = ingine::model::make_generator(options);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     size_t free1 = 0;

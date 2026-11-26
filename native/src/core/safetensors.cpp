@@ -437,6 +437,7 @@ UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cuda
     }
 
     std::vector<Chunk> chunks;
+    std::vector<Slice> slices;
     UploadStats stats;
     for (const UploadRequest& r : requests) {
         if (r.bytes == 0) { continue; }
@@ -448,16 +449,27 @@ UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cuda
         }
         for (std::uint64_t done = 0; done < r.bytes;) {
             const std::uint64_t n = std::min<std::uint64_t>(r.bytes - done, options_.chunk_bytes);
-            chunks.push_back(Chunk{r.file, r.offset + done, n, static_cast<std::byte*>(r.dst) + done});
+            const std::uint64_t offset = r.offset + done;
+            if (chunks.empty() || chunks.back().file != r.file ||
+                chunks.back().offset + chunks.back().bytes != offset ||
+                n > options_.chunk_bytes - chunks.back().bytes) {
+                chunks.push_back(Chunk{r.file, offset, 0, slices.size(), 0});
+            }
+            Chunk& chunk = chunks.back();
+            chunk.bytes += n;
+            ++chunk.slice_count;
+            slices.push_back(Slice{static_cast<std::byte*>(r.dst) + done, n});
             done += n;
         }
         stats.bytes += r.bytes;
     }
     if (chunks.empty()) { return stats; }
+    stats.read_calls = chunks.size();
 
     {
         std::unique_lock lock(mutex_);
         chunks_         = std::move(chunks);
+        slices_         = std::move(slices);
         next_chunk_     = 0;
         stream_         = stream;
         error_          = nullptr;
@@ -466,6 +478,7 @@ UploadStats DeviceUploader::upload(std::span<const UploadRequest> requests, cuda
         work_cv_.notify_all();
         done_cv_.wait(lock, [this] { return active_workers_ == 0; });
         chunks_.clear();
+        slices_.clear();
     }
 
     // Every chunk's copy has been issued (or the job failed); wait until the data has landed so the
@@ -529,10 +542,15 @@ void DeviceUploader::run_chunks() {
             }
             {
                 std::lock_guard lock(stream_mutex_);
-                cuda_throw(cudaMemcpyAsync(chunk.dst, slot.host, chunk.bytes, cudaMemcpyHostToDevice,
-                                           stream_),
-                           "DeviceUploader: cudaMemcpyAsync");
-                slot.copy_inflight = true;
+                const std::byte* src = slot.host;
+                for (std::size_t i = 0; i < chunk.slice_count; ++i) {
+                    const Slice& slice = slices_[chunk.first_slice + i];
+                    cuda_throw(cudaMemcpyAsync(slice.dst, src, slice.bytes, cudaMemcpyHostToDevice,
+                                               stream_),
+                               "DeviceUploader: cudaMemcpyAsync");
+                    slot.copy_inflight = true;
+                    src += slice.bytes;
+                }
                 cuda_throw(cudaEventRecord(slot.done, stream_), "DeviceUploader: cudaEventRecord");
             }
         } catch (...) {

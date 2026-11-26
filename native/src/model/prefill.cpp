@@ -41,7 +41,21 @@ std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* 
 
 }  // namespace
 
-Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int stage_mib)
+struct Prefiller::ExpertTransfer {
+  cudaStream_t stream = nullptr;
+  cudaEvent_t ready = nullptr;
+  cudaEvent_t consumed = nullptr;
+
+  ~ExpertTransfer() {
+    if (stream) cudaStreamSynchronize(stream);
+    if (ready) cudaEventDestroy(ready);
+    if (consumed) cudaEventDestroy(consumed);
+    if (stream) cudaStreamDestroy(stream);
+  }
+};
+
+Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int stage_mib,
+                     bool overlap)
     : w_(w), abl_(abl), max_chunk_(max_chunk), stream_(stream), gemm_(std::make_unique<pk::Gemm>()) {
   bool tiered = false;
   for (int l = 0; l < LAYERS; ++l) tiered |= w.experts_keep[l] > w.experts_hot[l];
@@ -86,12 +100,18 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
+  if (stage_.p && overlap) {
+    transfer_ = std::make_unique<ExpertTransfer>();
+    CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_->stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&transfer_->ready, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&transfer_->consumed, cudaEventDisableTiming));
+  }
 }
 
 Prefiller::~Prefiller() = default;
 
 std::size_t Prefiller::device_bytes() const {
-  std::size_t n = 0;
+  std::size_t n = stage_.bytes;
   for (const auto& b : storage_) n += b.bytes;
   return n;
 }
@@ -163,6 +183,32 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     }
   };
 
+  auto stage_experts = [&](const Layer& layer, pk::MoeExperts& me, cudaStream_t copy_stream) {
+    const int hot = w.experts_hot[layer.idx], keep = w.experts_keep[layer.idx];
+    if (!stage_.p || keep <= hot) return;
+    const Experts& experts = layer.experts;
+    const std::size_t b13 = experts.w13.bytes() / EXPERTS, b13s = experts.w13_scale.bytes() / EXPERTS;
+    const std::size_t b2 = experts.w2.bytes() / EXPERTS, b2s = experts.w2_scale.bytes() / EXPERTS;
+    const std::size_t bytes_per_expert = b13 + b13s + b2 + b2s;
+    const int n = std::min<int>(keep - hot, int(stage_.bytes / bytes_per_expert));
+    if (n == 0) return;
+
+    char* dst = static_cast<char*>(stage_.p);
+    auto copy = [&](const Tensor& tensor, std::size_t bytes) {
+      char* start = dst;
+      CUDA_CHECK(cudaMemcpyAsync(start, static_cast<const char*>(tensor.data) + std::size_t(hot) * bytes,
+                                 std::size_t(n) * bytes, cudaMemcpyDefault, copy_stream));
+      dst += std::size_t(n) * bytes;
+      return start;
+    };
+    me.stage_w13 = copy(experts.w13, b13);
+    me.stage_w13_scale = copy(experts.w13_scale, b13s);
+    me.stage_w2 = copy(experts.w2, b2);
+    me.stage_w2_scale = copy(experts.w2_scale, b2s);
+    me.stage_first = hot;
+    me.stage_n = n;
+  };
+
   pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
   dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
   // image tokens: the vision tower's rows take the place of the placeholder's embedding (model.forward's
@@ -177,6 +223,15 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   for (int v = 0; v < NUM_VISITS; ++v) {
     const int l = VISITS[v].layer, p = VISITS[v].pass;
     const Layer& layer = w.layers[l];
+    const Experts& ex = layer.experts;
+    pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
+                      f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
+    if (transfer_ && w.experts_keep[l] > w.experts_hot[l]) {
+      // Reuse the same VRAM slab. The copy waits for the previous visit's grouped GEMMs to release it.
+      CUDA_CHECK(cudaStreamWaitEvent(transfer_->stream, transfer_->consumed, 0));
+      stage_experts(layer, me, transfer_->stream);
+      if (me.stage_n) CUDA_CHECK(cudaEventRecord(transfer_->ready, transfer_->stream));
+    }
     const bool msgs = is_loop_layer(l) && p > 0;
     const bool boundary = l % BLOCK == 0;
     const std::vector<const float*> blocks = blocks_of(l, p, B0_, B1_, B2_, E_);
@@ -259,11 +314,15 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       const int fi = FULL_INDEX[v];
       const std::size_t es = st.kv_fp8 ? 1 : 2, off = std::size_t(pos0) * KV_DIM * es;
       void* kc = st.k_full_at(fi).data;
-      void* vc = st.v_full_at(fi).data;
-      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off, ap.out_fp8 = st.kv_fp8;
+      const Tensor v_cache = st.v_full_at(fi);
+      void* vc = v_cache.data;
+      const std::size_t v_off = std::size_t(pos0) * (v_cache.bytes() / st.max_ctx);
+      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + v_off, ap.out_fp8 = st.kv_fp8;
+      ap.out_v4 = st.kv_v4;
       pk::attn_prep(ap, s);
       at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;
       at.window = 0;
+      at.kv_v4 = st.kv_v4;
     } else {
       const int ri = RING_INDEX[v];
       auto* k_ring = static_cast<__nv_bfloat16*>(st.k_ring_at(ri).data);
@@ -312,41 +371,11 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
     pk::moe_route(idx_, T, work, s);
-    const Experts& ex = layer.experts;
-    pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
-                      f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
-    // RTX 5080 port: copy this visit's host-resident experts (indices hot..keep-1, contiguous) into VRAM so the
-    // grouped GEMMs stream them at device bandwidth; the copy runs at PCIe speed (~53 GB/s), once per visit.
-    {
-      const int hot = w.experts_hot[layer.idx], keep = w.experts_keep[layer.idx];
-      // every chunk: the GEMMs reading host memory directly are latency-bound (a 50-token prompt took 0.7 s),
-      // while staging all of a visit's cold experts costs about 66 ms per prefill call in total
-      if (stage_.p && keep > hot) {
-        const std::size_t b13 = ex.w13.bytes() / EXPERTS, b13s = ex.w13_scale.bytes() / EXPERTS;
-        const std::size_t b2 = ex.w2.bytes() / EXPERTS, b2s = ex.w2_scale.bytes() / EXPERTS;
-        const std::size_t eb = b13 + b13s + b2 + b2s;
-        const int n = std::min<int>(keep - hot, int(stage_.bytes / eb));
-        if (n > 0) {
-          char* base = static_cast<char*>(stage_.p);
-          char* d13 = base;
-          char* d13s = d13 + n * b13;
-          char* d2 = d13s + n * b13s;
-          char* d2s = d2 + n * b2;
-          auto cp = [&](void* dst, const Tensor& t, std::size_t per) {
-            CUDA_CHECK(cudaMemcpyAsync(dst, static_cast<const char*>(t.data) + std::size_t(hot) * per, std::size_t(n) * per,
-                                       cudaMemcpyDefault, s));
-          };
-          cp(d13, ex.w13, b13);
-          cp(d13s, ex.w13_scale, b13s);
-          cp(d2, ex.w2, b2);
-          cp(d2s, ex.w2_scale, b2s);
-          me.stage_first = hot, me.stage_n = n;
-          me.stage_w13 = d13, me.stage_w13_scale = d13s, me.stage_w2 = d2, me.stage_w2_scale = d2s;
-        }
-      }
-    }
+    if (!transfer_) stage_experts(layer, me, s);
+    else if (me.stage_n) CUDA_CHECK(cudaStreamWaitEvent(s, transfer_->ready, 0));
     pk::moe_gate_up(me, xm_, T, work, act_, s);
     pk::moe_down(me, act_, T, work, down_, s);
+    if (transfer_ && me.stage_n) CUDA_CHECK(cudaEventRecord(transfer_->consumed, s));
     if (stats_) pk::moe_stats(idx_, wts_, down_, T, stats_ + std::size_t(v) * EXPERTS * 3, s);
     pk::moe_combine(down_, wts_, T, moe_sum_, s);
     pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);

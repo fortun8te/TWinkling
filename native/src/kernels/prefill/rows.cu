@@ -2,6 +2,7 @@
 // convolutions over time, message-gate pieces, taps, and the last row's logits. Arithmetic follows the PyTorch
 // reference operation by operation (separately rounded products/sums where torch runs separate kernels;
 // divisions by Python scalars as multiplications by the FP32 reciprocal, as torch does).
+#include "kernels/common/value4.cuh"
 #include "kernels/prefill/common.cuh"
 #include "kernels/prefill/prefill.h"
 
@@ -134,7 +135,9 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
       for (int q = 0; q < 4; ++q) y[q] = round_bf16(y[q] * r);
     }
     void* dst = kv == 0 ? p.k_out : p.v_out;
-    if (p.out_fp8) {  // State.full_store: saturate to +-448, E4M3 round to nearest even
+    if (p.out_v4 && kv == 1) {
+      value4::store(value4::head(static_cast<char*>(p.v_out), size_t(t) * kKvHeads + warp), lane, y);
+    } else if (p.out_fp8) {  // State.full_store: saturate to +-448, E4M3 round to nearest even
       const uint32_t b = uint32_t(f2e4m3(y[0])) | (uint32_t(f2e4m3(y[1])) << 8) | (uint32_t(f2e4m3(y[2])) << 16) |
                          (uint32_t(f2e4m3(y[3])) << 24);
       *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(dst) + size_t(t) * kKvDim + c) = b;
@@ -328,6 +331,8 @@ __global__ void __launch_bounds__(256) head_kernel(const uint16_t* __restrict__ 
 }  // namespace
 
 void attn_prep(const AttnPrepParams& p, cudaStream_t stream) {
+  if (p.out_v4 && (!p.out_fp8 || !p.full))
+    throw std::invalid_argument("prefill attention: INT4 values require FP8 keys on a full visit");
   if (p.T <= 0 || !p.proj || !p.q || !p.rel || !p.k_out || !p.v_out || !p.conv_k || !p.conv_v)
     throw std::invalid_argument("attn_prep: missing argument");
   attn_prep_kernel<<<p.T, 256, 0, stream>>>(p);

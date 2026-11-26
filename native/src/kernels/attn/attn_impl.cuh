@@ -251,19 +251,26 @@ __device__ __forceinline__ float clip_factor(float ss, float t) {
     return fminf(1.f, __fdividef(t, norm + 1e-6f));
 }
 
-template <typename KV>  // 8 dims of a cache row: uint4 = BF16, uint2 = E4M3
+__device__ __forceinline__ void unpack8(const value4::Slice q, float f[8]) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) f[i] = value4::decode(q.nibble >> (4 * i), q.scale);
+}
+
+template <typename K, typename V = K>
 struct Buf {
-    KV k[U], v[U];
+    K k[U];
+    V v[U];
     int kp[U];    // key position, -1 = no key
     int dp[U];    // distance the rel_proj prefetch was made for
     float rp[U];  // rel_proj[c][dp] (0 if dp >= 1024)
 };
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, bool V4>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
-    static_assert(FULL || !F8, "FP8 caches are full-layer only");
+    static_assert((FULL || !F8) && (!V4 || F8), "invalid full-layer cache precision");
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
+    using CacheBuf = Buf<KV, std::conditional_t<V4, value4::Slice, KV>>;
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
     using L = Smem<M, F8>;
     extern __shared__ __align__(16) float sm[];
@@ -301,17 +308,21 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     constexpr int STEP = KW * 2 * U, TILE = 2 * STEP, STRIDE = CS * TILE;
     const int c0 = rank * TILE, old_end = L_old;
     const std::uint64_t kvpol = l2::policy<KV_L2>();
-    auto load_kv = [&](Buf<KV>& b, const int base) {
+    auto load_kv = [&](CacheBuf& b, const int base) {
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const int j = base + (kw * U + u) * 2 + half;
-            b.k[u] = b.v[u] = KV{};
+            b.k[u] = {};
+            b.v[u] = {};
             b.kp[u] = -1;
             if (j < old_end) {
                 const size_t off = (size_t(j) * HKV + g) * D + c * 8;
                 if constexpr (F8) {
                     b.k[u] = ld_kv8(kc + off, kvpol);
-                    b.v[u] = ld_kv8(vc + off, kvpol);
+                    if constexpr (V4)
+                        b.v[u] = value4::load(value4::head(static_cast<const char*>(p.v_cache), size_t(j) * HKV + g), c);
+                    else
+                        b.v[u] = ld_kv8(vc + off, kvpol);
                 } else {
                     b.k[u] = ld_kv(kc + off, kvpol);
                     b.v[u] = ld_kv(vc + off, kvpol);
@@ -320,7 +331,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             }
         }
     };
-    auto load_rp = [&](Buf<KV>& b, const int base) {
+    auto load_rp = [&](CacheBuf& b, const int base) {
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const int j = base + (kw * U + u) * 2 + half;
@@ -329,7 +340,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             b.rp[u] = j < old_end && b.dp[u] < EXT ? __ldg(p.rel_proj + c * EXT + b.dp[u]) : 0.f;
         }
     };
-    auto load = [&](Buf<KV>& b, const int base) {
+    auto load = [&](CacheBuf& b, const int base) {
         load_kv(b, base);
         load_rp(b, base);
     };
@@ -388,6 +399,16 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
                 const bool ok = j < L_old;
                 char* dst = raw + (t % NRAW) * RAWB + kv * KT * D + key * D + (kv ? ch : ch ^ (key & 7)) * 16;
+                if constexpr (V4) {
+                    if (kv) {
+                        const auto src = value4::head(static_cast<const char*>(p.v_cache), size_t(ok ? j : 0) * HKV + g);
+                        if (ch < value4::kPackedBytes / 16)
+                            cp16z(reinterpret_cast<float*>(dst), reinterpret_cast<const float*>(src.packed + ch * 16), ok, kvpol);
+                        if (ch == value4::kPackedBytes / 16)
+                            cp4z(reinterpret_cast<float*>(dst), reinterpret_cast<const float*>(src.scale), ok);
+                        continue;
+                    }
+                }
                 cp16z(reinterpret_cast<float*>(dst),
                       reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok,
                       kvpol);
@@ -399,7 +420,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // p0 were written two or more kernels back (see PDL above), and the staged inputs then come in one
     // round trip that is not queued behind the K/V burst (issued after the wait, ahead of the staged
     // inputs, the burst delays them by ~2 us; behind them it costs a round trip).
-    Buf<KV> A, B;
+    CacheBuf A, B;
     if constexpr (M == 1) {
         if (c0 < old_end) load_kv(A, c0);
         if (c0 + STEP < old_end) load_kv(B, c0 + STEP);
@@ -567,9 +588,19 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
             const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
             float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
-            if constexpr (F8) {  // the values the cache will hold: BF16, then E4M3 (exact in BF16)
+            if constexpr (F8) {
 #pragma unroll
-                for (int e = 0; e < 4; ++e) y[e] = e4m3r(bf16r(y[e]));
+                for (int e = 0; e < 4; ++e) y[e] = bf16r(y[e]);
+                if constexpr (V4) {
+                    if (kv == 1) {
+                        auto row = value4::head(static_cast<char*>(p.v_cache), size_t(p0 + m) * HKV + g);
+                        value4::store(row, lane, y);
+                    }
+                }
+                if (!V4 || kv == 0) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) y[e] = e4m3r(y[e]);
+                }
             }
             const uint2 v = make_uint2(pack2(y[0], y[1]), pack2(y[2], y[3]));
             reinterpret_cast<uint2*>(&s_nkv[kv][m][0])[lane] = v;
@@ -760,15 +791,23 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 #pragma unroll
             for (int n = 0; n < NCH; ++n) {
                 const int i = tid + n * NT, key = i / (D / 16), ch = i % (D / 16);
-                const uint4 r = *reinterpret_cast<const uint4*>(raw + slot * RAWB + KT * D + key * D + ch * 16);
+                const char* row = raw + slot * RAWB + KT * D + key * D;
+                uint4 r{};
+                if constexpr (!V4) r = *reinterpret_cast<const uint4*>(row + ch * 16);
                 const uint32_t w[4] = {r.x, r.y, r.z, r.w};
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {  // dims 16 ch + 8 h .. + 7
                     uint32_t o[4];
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
-                        const float2 f = e4m3x2_f2((w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu);
-                        o[e] = half2_of(f.x, f.y);
+                        if constexpr (V4) {
+                            const float scale = *reinterpret_cast<const float*>(row + value4::kPackedBytes);
+                            const auto bits = reinterpret_cast<const uint32_t*>(row)[2 * ch + h] >> (8 * e);
+                            o[e] = half2_of(value4::decode(bits, scale), value4::decode(bits >> 4, scale));
+                        } else {
+                            const float2 f = e4m3x2_f2((w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu);
+                            o[e] = half2_of(f.x, f.y);
+                        }
                     }
                     *reinterpret_cast<uint4*>(wv + roff(key, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
                 }
@@ -1050,6 +1089,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     if (owner) {
         for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
             const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+            if constexpr (V4) {
+                if (kv == 1) continue;  // written by the owner when it quantized its new values
+            }
             const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
             const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
             CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
@@ -1082,10 +1124,10 @@ struct Kernel {
     size_t smem;
 };
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, bool V4>
 Kernel kernel_of() {
     static const Kernel k = [] {
-        const KernelFn f = attn_decode_kernel<M, FULL, F8>;
+        const KernelFn f = attn_decode_kernel<M, FULL, F8, V4>;
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
         return Kernel{f, M, Smem<M, F8>::BYTES};
@@ -1093,17 +1135,17 @@ Kernel kernel_of() {
     return k;
 }
 
-template <bool FULL, bool F8 = false>
+template <bool FULL, bool F8 = false, bool V4 = false>
 Kernel select(int M) {
     switch (M) {
-        case 1: return kernel_of<1, FULL, F8>();
-        case 2: return kernel_of<2, FULL, F8>();
-        case 3: return kernel_of<3, FULL, F8>();
-        case 4: return kernel_of<4, FULL, F8>();
-        case 5: return kernel_of<5, FULL, F8>();
-        case 6: return kernel_of<6, FULL, F8>();
-        case 7: return kernel_of<7, FULL, F8>();
-        default: return kernel_of<8, FULL, F8>();
+        case 1: return kernel_of<1, FULL, F8, V4>();
+        case 2: return kernel_of<2, FULL, F8, V4>();
+        case 3: return kernel_of<3, FULL, F8, V4>();
+        case 4: return kernel_of<4, FULL, F8, V4>();
+        case 5: return kernel_of<5, FULL, F8, V4>();
+        case 6: return kernel_of<6, FULL, F8, V4>();
+        case 7: return kernel_of<7, FULL, F8, V4>();
+        default: return kernel_of<8, FULL, F8, V4>();
     }
 }
 
@@ -1151,6 +1193,7 @@ void attn_decode_impl(const DecodeArgs& a, cudaStream_t stream) {
     require(a.proj && a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv && a.conv_k_state &&
                 a.conv_v_state && a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
             "null argument");
+    require(!a.cache_v4 || (full && a.cache_fp8), "INT4 values require FP8 keys on a full visit");
     require(full || !a.cache_fp8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
@@ -1179,7 +1222,8 @@ void attn_decode_impl(const DecodeArgs& a, cudaStream_t stream) {
     p.counter = static_cast<int*>(a.workspace);
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
-    const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
+    const Kernel k = a.cache_v4 ? select<true, true, true>(M)
+                                     : full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));

@@ -2,6 +2,7 @@
 // full dynamic conv with log scaling, BF16 and FP8 key/value outputs, conv state before the chunk),
 // rel_logits, static_conv + conv_state_update (T < 3 and T > 3), message gates, head logits (BF16 and FP8
 // rows), the cuBLASLt GEMM wrapper, taps.
+#include "common/value4_oracle.h"
 #include "kernels/prefill/prefill.h"
 #include "prefill/prefill_test.h"
 
@@ -32,7 +33,7 @@ std::vector<float> rand_f32(Rng& rng, size_t n, double scale, double offset = 0)
 
 double clipf(double sumsq, double thr) { return std::min(thr / (std::sqrt(sumsq) + 1e-6), 1.0); }
 
-bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
+bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0, bool v4 = false) {
   const int ld = full ? 8664 : 8600;
   const auto proj = rand_bf16(rng, size_t(T) * ld, 1.0);
   const auto q_scale = rand_f32(rng, HQ * D, 0.3, 1.0), r_scale = rand_f32(rng, HQ * 16, 0.3, 1.0);
@@ -40,17 +41,20 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
   const auto conv_k = rand_f32(rng, 3 * KV, 1.0), conv_v = rand_f32(rng, 3 * KV, 1.0);
   DeviceArray<uint16_t> d_proj(proj), q(size_t(T) * HQ * D), rel(size_t(T) * HQ * 16);
   DeviceArray<float> d_qs(q_scale), d_rs(r_scale), d_kw(kw), d_vw(vw), d_ck(conv_k), d_cv(conv_v);
-  DeviceArray<uint8_t> kout(size_t(T) * KV * 2), vout(size_t(T) * KV * 2);
+  DeviceArray<uint8_t> kout(size_t(T) * KV * 2);
+  const size_t value_bytes = size_t(T) * (v4 ? HK * ingine::kernels::value4::kHeadBytes : KV * 2);
+  DeviceArray<uint8_t> vout(value_bytes);
   pk::AttnPrepParams p;
   p.proj = reinterpret_cast<const __nv_bfloat16*>(d_proj.get()), p.ld = ld, p.T = T, p.pos0 = pos0, p.full = full;
   p.q_scale = d_qs.get(), p.r_scale = d_rs.get(), p.k_w = d_kw.get(), p.v_w = d_vw.get();
   p.conv_k = d_ck.get(), p.conv_v = d_cv.get();
   p.q = reinterpret_cast<__nv_bfloat16*>(q.get()), p.rel = reinterpret_cast<__nv_bfloat16*>(rel.get());
-  p.k_out = kout.get(), p.v_out = vout.get(), p.out_fp8 = fp8;
+  p.k_out = kout.get(), p.v_out = vout.get(), p.out_fp8 = fp8, p.out_v4 = v4;
   pk::attn_prep(p, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto gq = q.download(), grel = rel.download();
   const auto gk = kout.download(), gv = vout.download();
+  const auto gv4 = v4 ? unpack_value4_oracle(gv, [](float x) { return rbf(x); }) : std::vector<float>{};
   auto P = [&](int t, int c) { return double(bf16_val(proj[size_t(t) * ld + c])); };
 
   std::vector<float> got_q, got_r, got_k, got_v;
@@ -103,7 +107,9 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
           const auto& gout = kv ? gv : gk;
           float got;
           double ref = r;
-          if (fp8) {
+          if (v4 && kv) {
+            got = gv4[i];
+          } else if (fp8) {
             got = e4m3_to_float(gout[i]);
             ref = e4m3_to_float(e4m3_bits(float(r)));
           } else {
@@ -114,8 +120,9 @@ bool test_attn_prep(Rng& rng, bool full, bool fp8, int T, int pos0) {
       }
     }
   }
+  if (v4) pack_value4_oracle(ref_v, [](float x) { return rbf(x); });
   char name[64];
-  std::snprintf(name, sizeof name, "attn_prep %s%s T=%d", full ? "full" : "sliding", fp8 ? " fp8" : "", T);
+  std::snprintf(name, sizeof name, "attn_prep %s%s T=%d", full ? "full" : "sliding", v4 ? " fp8/v4" : fp8 ? " fp8" : "", T);
   bool ok = true;
   const double tol = fp8 ? 0.07 : 8e-3;  // one ulp of the output format (a rounding flip)
   std::string n = name;
@@ -343,6 +350,7 @@ int main() {
   ok &= test_attn_prep(rng, false, false, 2, 37);
   ok &= test_attn_prep(rng, true, false, 7, 9000);
   ok &= test_attn_prep(rng, true, true, 7, 20000);
+  ok &= test_attn_prep(rng, true, true, 7, 20000, true);
   ok &= test_rel_logits(rng, 21);
   ok &= test_rel_logits(rng, 300);
   ok &= test_conv(rng, 2);

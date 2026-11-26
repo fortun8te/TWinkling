@@ -1,6 +1,7 @@
 // Prefill attention against an FP64 oracle of model.Model._attend (+ flex's sink factor and the output gate):
 // full-attention caches (BF16 and FP8 E4M3, keys past the relative extent), sliding rings (partially filled,
 // wrapped, a stale slot, chunks longer than the window), ring_gather / key_tile_bounds / ring_update.
+#include "common/value4_oracle.h"
 #include "kernels/prefill/prefill.h"
 #include "prefill/prefill_test.h"
 
@@ -103,11 +104,11 @@ std::vector<double> oracle(const Inputs& in, const std::vector<float>& K, const 
 
 bool run_attention(const char* name, const Inputs& in, const void* k_dev, const void* v_dev, bool fp8,
                    const int* kpos_dev, const int4* bounds_dev, int L, int window, const std::vector<float>& K,
-                   const std::vector<float>& V, const std::vector<int>& kpos, int stride) {
+                   const std::vector<float>& V, const std::vector<int>& kpos, int stride, bool v4 = false) {
   DeviceArray<uint16_t> q(in.q), rel(in.rel), proj(in.proj), out(size_t(in.T) * HQ * D);
   pk::AttnParams p;
   p.q = reinterpret_cast<const __nv_bfloat16*>(q.get());
-  p.k = k_dev, p.v = v_dev, p.kv_fp8 = fp8;
+  p.k = k_dev, p.v = v_dev, p.kv_fp8 = fp8, p.kv_v4 = v4;
   p.kpos = kpos_dev, p.bounds = bounds_dev, p.L = L;
   p.T = in.T, p.pos0 = in.pos0, p.window = window;
   p.rel = reinterpret_cast<const __nv_bfloat16*>(rel.get());
@@ -124,17 +125,26 @@ bool run_attention(const char* name, const Inputs& in, const void* k_dev, const 
   return check_close(name, got, ref, 1.2e-2, 2e-4);
 }
 
-bool full_case(Rng& rng, bool fp8, int pos0, int T) {
+bool full_case(Rng& rng, bool fp8, int pos0, int T, bool v4 = false) {
   const int L = pos0 + T, rows = L + 37;  // extra rows past L: never read
   std::vector<float> K(size_t(rows) * HK * D), V(K.size());
   for (int j = 0; j < rows; ++j) make_kv_row(rng, &K[size_t(j) * HK * D], &V[size_t(j) * HK * D]);
-  DeviceArray<uint8_t> kd(K.size() * (fp8 ? 1 : 2)), vd(K.size() * (fp8 ? 1 : 2));
+  DeviceArray<uint8_t> kd(K.size() * (fp8 ? 1 : 2));
+  const size_t v_bytes = v4 ? size_t(rows) * HK * ingine::kernels::value4::kHeadBytes : kd.count;
+  DeviceArray<uint8_t> vd(v_bytes);
   if (fp8) {
     std::vector<uint8_t> kb(K.size()), vb(K.size());
     for (size_t i = 0; i < K.size(); ++i) {
-      kb[i] = e4m3_bits(K[i]), vb[i] = e4m3_bits(V[i]);
-      K[i] = e4m3_to_float(kb[i]), V[i] = e4m3_to_float(vb[i]);
+      kb[i] = e4m3_bits(K[i]);
+      K[i] = e4m3_to_float(kb[i]);
+      if (v4) {
+        V[i] = bf16_val(bf16_bits(V[i]));
+      } else {
+        vb[i] = e4m3_bits(V[i]);
+        V[i] = e4m3_to_float(vb[i]);
+      }
     }
+    if (v4) vb = pack_value4_oracle(V, [](float v) { return bf16_val(bf16_bits(v)); });
     kd.upload(kb), vd.upload(vb);
   } else {
     std::vector<uint16_t> kb(K.size()), vb(K.size());
@@ -148,8 +158,8 @@ bool full_case(Rng& rng, bool fp8, int pos0, int T) {
   for (int j = 0; j < L; ++j) kpos[j] = j;
   const Inputs in = make_inputs(rng, T, pos0);
   char name[96];
-  std::snprintf(name, sizeof name, "full %s pos0=%d T=%d", fp8 ? "fp8" : "bf16", pos0, T);
-  return run_attention(name, in, kd.get(), vd.get(), fp8, nullptr, nullptr, L, 0, K, V, kpos, 1);
+  std::snprintf(name, sizeof name, "full %s pos0=%d T=%d", v4 ? "fp8/v4" : fp8 ? "fp8" : "bf16", pos0, T);
+  return run_attention(name, in, kd.get(), vd.get(), fp8, nullptr, nullptr, L, 0, K, V, kpos, 1, v4);
 }
 
 // Sliding visit: ring state before the chunk (ring_pos per slot), chunk keys, gathered rows.
@@ -239,9 +249,12 @@ int main() {
   ok &= full_case(rng, false, 1200, 77);
   ok &= full_case(rng, true, 1200, 77);
   ok &= full_case(rng, true, 3, 130);
+  ok &= full_case(rng, true, 1200, 77, true);
+  ok &= full_case(rng, true, 3, 130, true);
   ok &= sliding_case(rng, 0, 50, false, 1);
   ok &= sliding_case(rng, 700, 300, false, 3);
   ok &= sliding_case(rng, 5000, 1100, true, 7);
+  ok &= sliding_case(rng, 5000, 4096, true, 1);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

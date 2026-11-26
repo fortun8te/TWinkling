@@ -40,7 +40,8 @@ class Prefiller {
  public:
   // stage_mib (RTX 5080 port): VRAM for copies of a visit's host-resident experts (RuntimeOptions::expert_plan)
   // during every chunk; 0: the GEMMs read host memory over PCIe.
-  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int stage_mib = 0);
+  Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaStream_t stream, int stage_mib = 0,
+            bool overlap = false);
   ~Prefiller();
   Prefiller(const Prefiller&) = delete;
   Prefiller& operator=(const Prefiller&) = delete;
@@ -85,6 +86,8 @@ class Prefiller {
   int kpos_rows_;
   float* stats_ = nullptr;
   DeviceBuffer stage_;
+  struct ExpertTransfer;
+  std::unique_ptr<ExpertTransfer> transfer_;
 };
 
 }  // namespace ingine::model

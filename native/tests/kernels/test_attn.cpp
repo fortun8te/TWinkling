@@ -6,6 +6,7 @@
 // random bytes in the rows at and after p0 + M (stale speculative rows) and require identical output bits.
 // Synthetic layer parameters; caches of 10016 rows (about 40 MB).
 #include "kernels/oracle.h"
+#include "common/value4_oracle.h"
 
 #include "kernels/attn/attn.h"
 
@@ -43,7 +44,7 @@ struct Cache {
 
 float stored(float x, bool fp8) { return fp8 ? e4m3_to_float(float_to_e4m3(x)) : x; }
 
-Cache make_cache(Rng& rng, int rows, bool fp8) {
+Cache make_cache(Rng& rng, int rows, bool fp8, bool v4) {
   Cache c;
   c.k.resize(size_t(rows) * C);
   c.v.resize(c.k.size());
@@ -58,7 +59,7 @@ Cache make_cache(Rng& rng, int rows, bool fp8) {
       const double rv = 1.0 / std::sqrt(sv / D + 1e-6);
       for (int d = 0; d < D; ++d) {
         c.k[(size_t(r) * HKV + g) * D + d] = stored(round_bf16(float(k[d] * f)), fp8);
-        c.v[(size_t(r) * HKV + g) * D + d] = stored(round_bf16(float(v[d] * rv)), fp8);
+        c.v[(size_t(r) * HKV + g) * D + d] = stored(round_bf16(float(v[d] * rv)), fp8 && !v4);
       }
     }
   auto bytes = [&](const std::vector<float>& x) {
@@ -74,7 +75,7 @@ Cache make_cache(Rng& rng, int rows, bool fp8) {
     return b;
   };
   c.dk.emplace(bytes(c.k));
-  c.dv.emplace(bytes(c.v));
+  c.dv.emplace(v4 ? pack_value4_oracle(c.v, [](float v) { return round_bf16(v); }) : bytes(c.v));
   return c;
 }
 
@@ -98,6 +99,7 @@ struct Case {
   bool full, fp8;
   int M, p0;
   std::vector<int64_t> kpos;  // sliding: ring positions before the call
+  bool v4 = false;
 };
 
 bool run(Rng& rng, const Case& cs) {
@@ -121,7 +123,7 @@ bool run(Rng& rng, const Case& cs) {
   const std::vector<float> rel_proj = randn_bf16(rng, DREL * EXT, 0.5);
   const std::vector<float> kconv = randn_bf16(rng, 4 * C, 0.3), vconv = randn_bf16(rng, 4 * C, 0.3);  // [C,4] | [4,C]
   const std::vector<float> ck0 = randn_bf16(rng, 3 * C, 1.0), cv0 = randn_bf16(rng, 3 * C, 1.0);
-  Cache cache = make_cache(rng, rows, fp8);
+  Cache cache = make_cache(rng, rows, fp8, cs.v4);
   DeviceArray<float> dproj(proj), dqs(q_scale), drs(r_scale), drp(rel_proj), dkc(kconv), dvc(vconv), dck(ck0),
       dcv(cv0);
   std::vector<int64_t> kpos = cs.kpos;
@@ -142,6 +144,7 @@ bool run(Rng& rng, const Case& cs) {
   a.k_cache = cache.dk->get();
   a.v_cache = cache.dv->get();
   a.cache_fp8 = fp8;
+  a.cache_v4 = cs.v4;
   a.cache_rows = rows;
   a.kpos = full ? nullptr : dkpos.get();
   a.pos = dpos.get();
@@ -209,7 +212,8 @@ bool run(Rng& rng, const Case& cs) {
     for (int d = 0; d < D; ++d) nv[size_t(r) * D + d] *= rv;
   }
   for (auto& v : nk) v = stored(float(rbf(v)), fp8);
-  for (auto& v : nv) v = stored(float(rbf(v)), fp8);
+  for (auto& v : nv) v = stored(float(rbf(v)), fp8 && !cs.v4);
+  if (cs.v4) pack_value4_oracle(nv, [](float v) { return round_bf16(v); });
 
   // ---- oracle: attention over the old entries valid for each token + the call's keys up to it
   std::vector<double> exact(size_t(M) * HQ * D), spec(exact.size());
@@ -260,7 +264,9 @@ bool run(Rng& rng, const Case& cs) {
   const std::string n = cs.name;
   bool ok = Check{(n + " out").c_str(), 1.0 / 128, 2e-3, 0.02}(bf16_download(out), exact, &spec);
   // new cache rows (rare one-ulp flips of the BF16 rounding allowed)
-  const auto gk = cache_values(*cache.dk, fp8), gv = cache_values(*cache.dv, fp8);
+  const auto gk = cache_values(*cache.dk, fp8);
+  const auto gv = cs.v4 ? unpack_value4_oracle(cache.dv->download(), [](float v) { return round_bf16(v); })
+                        : cache_values(*cache.dv, fp8);
   std::vector<float> rk, rv;
   std::vector<double> wk, wv;
   for (int m = 0; m < M; ++m) {
@@ -291,7 +297,9 @@ bool run(Rng& rng, const Case& cs) {
     size_t diff = 0;
     for (int rep = 0; rep < 2; ++rep) {
       std::vector<uint8_t> kb = cache.dk->download(), vb = cache.dv->download();
-      for (size_t i = size_t(p0) * rb; i < kb.size(); ++i) kb[i] = uint8_t(rng.next()), vb[i] = uint8_t(rng.next());
+      const auto v_stride = cs.v4 ? HKV * ingine::kernels::value4::kHeadBytes : rb;
+      for (size_t i = size_t(p0) * rb; i < kb.size(); ++i) kb[i] = uint8_t(rng.next());
+      for (size_t i = size_t(p0) * v_stride; i < vb.size(); ++i) vb[i] = uint8_t(rng.next());
       cache.dk->upload(kb);
       cache.dv->upload(vb);
       dck.upload(ck0);
@@ -358,6 +366,14 @@ int main() {
     c.full = true, c.fp8 = true, c.M = M, c.p0 = 4637;
     c.name = "full fp8 p0=4637 M=" + std::to_string(M);
     ok &= run(rng, c);
+  }
+  for (int pos : {0, 4637}) {
+    for (int m : {1, 2, 4, 8}) {
+      Case c;
+      c.full = true, c.fp8 = true, c.v4 = true, c.M = m, c.p0 = pos;
+      c.name = "full fp8/v4 p0=" + std::to_string(pos) + " M=" + std::to_string(m);
+      ok &= run(rng, c);
+    }
   }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

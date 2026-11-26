@@ -49,7 +49,7 @@ Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, cud
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
-State make_state(int max_ctx, bool kv_fp8);
+State make_state(int max_ctx, bool kv_fp8, bool kv_v4 = false);
 Buffers make_buffers(int m);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
@@ -164,8 +164,8 @@ class Runtime {
   // full_rows_bytes(n) long, packed), restore_full_rows puts them back. A checkpoint taken at length n plus
   // its full rows [0, n) restore the state exactly, whatever ran in between. Stream-ordered.
   std::size_t full_rows_bytes(int n) const;
-  void save_full_rows(void* dst, int n);
-  void restore_full_rows(const void* src, int n);
+  void save_full_rows(void* dst, int n, cudaMemcpyKind direction = cudaMemcpyDefault);
+  void restore_full_rows(const void* src, int n, cudaMemcpyKind direction = cudaMemcpyDefault);
 
   // Speculative rollback (engine._generate_spec / _rollback). save_verify before a verify call of m rows at
   // P..P+m-1 saves the conv states and the ring slots (P + i) % WINDOW the call will overwrite;
