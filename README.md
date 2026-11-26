@@ -53,6 +53,8 @@ The 5080 launcher defaults to the 64K FP8 profile. Select `TWINKLING_PROFILE=128
 
 The tuned 128K preset uses 4,096-row prefill chunks and about 8.65 GiB of GPU-resident experts. In the paired tests on a quiet 250 W RTX 5080, it reduced first-token time on a 32,758-token prompt from 17.3 s to 9.9 s. Both 124,999-token coding outputs passed the same six functional checks, with the tuned recipe finishing in 58.9 s versus 94.2 s. A near-full tool and exact recall workflow passed with 742 MiB of observed GPU headroom.
 
+The tuned 256K preset uses 4,096-row chunks and about 7.4 GiB of GPU-resident experts. The CUDA scratch reuse frees 216 MiB at the previous placement. At the higher placement, the matched 255,935-token coding task returned the same correct code in 178.6 s versus 203.7 s. Cached recall and a separate tool round trip passed, with 686 MiB of observed GPU headroom during the deep coding test.
+
 `TWINKLING_KV=v4` keeps FP8 global keys and compresses global values to INT4. `TWINKLING_PREFILL_CHUNK` supports up to 4,096 rows, trading scratch memory for fewer expert transfers. `TWINKLING_PREFILL_OVERLAP=1` overlaps those transfers with attention work. `TWINKLING_PARK_HOST_MIB` sets an optional pinned host-memory budget for restoring displaced conversations.
 
 Use [qualify_long.py](benchmarks/rtx5080/qualify_long.py) against an isolated loopback server to check actual prompt depth, exact recall, coding, and tool round-trips. Test the intended placement and cache precision together and check free VRAM during both load and generation.
