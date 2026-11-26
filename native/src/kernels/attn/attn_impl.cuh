@@ -25,7 +25,7 @@ constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * CS * GQA * M *
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
 // dynamic shared memory layout (floats), per M
-template <int M, bool F8 = false>
+template <int M, bool F8 = false, bool V4 = false>
 struct Smem {
     static constexpr int ROWS = GQA * M;
     // staged inputs (dead once the main loop starts)
@@ -50,8 +50,11 @@ struct Smem {
     // in place. E4M3 caches (full layers): two raw tiles [2][K: KT][D] + [V: KT][D] bytes (K chunks
     // swizzled; K is read straight from them), V widened to fp16 in the staging region.
     static constexpr int KT = F8 ? 64 : 32;              // keys per tile
-    static constexpr int KVS = (UNION_END + 3) & ~3;     // 32 KB either way
-    static constexpr int KPS = KVS + (M > 1 ? 2 * KT * 2 * D * (F8 ? 1 : 2) / 4 : 0);  // kpos (int) [2][KT]
+    // Keep packed V rows 16-byte aligned for the asynchronous copies. The fifth chunk holds the scale.
+    static constexpr int RAW_V_STRIDE = V4 ? ((value4::kPackedBytes + sizeof(float) + 15) & ~15) : D;
+    static constexpr int RAW_TILE_BYTES = KT * (D + RAW_V_STRIDE);
+    static constexpr int KVS = (UNION_END + 3) & ~3;
+    static constexpr int KPS = KVS + (M > 1 ? (F8 ? 2 * RAW_TILE_BYTES / 4 : 2 * KT * D) : 0);  // kpos [2][KT]
     static constexpr int SRP = KPS + (M > 1 && !F8 ? 2 * KT : 0);      // rel_proj window [2][DREL][KT + MAXM]
     static constexpr int TILE_END = SRP + (M > 1 && !F8 ? 2 * DREL * (KT + MAXM) : 0);
     // dedicated regions
@@ -272,7 +275,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
     using CacheBuf = Buf<KV, std::conditional_t<V4, value4::Slice, KV>>;
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
-    using L = Smem<M, F8>;
+    using L = Smem<M, F8, V4>;
     extern __shared__ __align__(16) float sm[];
     __nv_bfloat16(*s_nkv)[M][D] = reinterpret_cast<__nv_bfloat16(*)[M][D]>(sm + L::NKV);
 
@@ -387,8 +390,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // straight into mma fragments), then V rows (widened to fp16 in the staging region, which is dead once
     // q / rel and the owner's convs are done). Every call commits a group (empty past the end), so the
     // group count per tile is fixed.
-    constexpr int NRAW = 2, RAWB = KT * 2 * D;  // E4M3 tiles in flight, bytes per tile
-    static_assert(!F8 || M == 1 || (NRAW * RAWB <= 2 * KT * 2 * D && KT * D * 2 <= L::UNION_END * 4),
+    constexpr int NRAW = 2, RAWB = L::RAW_TILE_BYTES;
+    static_assert(!F8 || M == 1 || (NRAW * RAWB == (L::KPS - L::KVS) * 4 && KT * D * 2 <= L::UNION_END * 4),
                   "E4M3 tiles and the widened V tile must fit the stage and staging regions");
     char* const raw = reinterpret_cast<char*>(sm + L::KVS);
     __half* const wv = reinterpret_cast<__half*>(sm);  // E4M3: the widened V tile [KT][D], chunks swizzled
@@ -398,10 +401,12 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
                 const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
                 const bool ok = j < L_old;
-                char* dst = raw + (t % NRAW) * RAWB + kv * KT * D + key * D + (kv ? ch : ch ^ (key & 7)) * 16;
+                char* const slot = raw + (t % NRAW) * RAWB;
                 if constexpr (V4) {
                     if (kv) {
+                        if (ch > value4::kPackedBytes / 16) continue;
                         const auto src = value4::head(static_cast<const char*>(p.v_cache), size_t(ok ? j : 0) * HKV + g);
+                        char* dst = slot + KT * D + key * L::RAW_V_STRIDE + ch * 16;
                         if (ch < value4::kPackedBytes / 16)
                             cp16z(reinterpret_cast<float*>(dst), reinterpret_cast<const float*>(src.packed + ch * 16), ok, kvpol);
                         if (ch == value4::kPackedBytes / 16)
@@ -409,6 +414,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                         continue;
                     }
                 }
+                char* dst = slot + kv * KT * D + key * D + (kv ? ch : ch ^ (key & 7)) * 16;
                 cp16z(reinterpret_cast<float*>(dst),
                       reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok,
                       kvpol);
@@ -796,7 +802,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
 #pragma unroll
                 for (int n = 0; n < chunks; ++n) {
                     const int i = tid + n * NT, key = i / slices, c8 = i % slices;
-                    const char* row = tile + key * D;
+                    const char* row = tile + key * L::RAW_V_STRIDE;
                     const float scale = *reinterpret_cast<const float*>(row + value4::kPackedBytes);
                     const float value = value4::decode(c8, scale);
                     const uint32_t entry = __half_as_ushort(__float2half_rn(fabsf(value) <= 65504.f ? value : 0.f));
@@ -1148,8 +1154,8 @@ Kernel kernel_of() {
     static const Kernel k = [] {
         const KernelFn f = attn_decode_kernel<M, FULL, F8, V4>;
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
-        return Kernel{f, M, Smem<M, F8>::BYTES};
+        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, V4>::BYTES)));
+        return Kernel{f, M, Smem<M, F8, V4>::BYTES};
     }();
     return k;
 }
