@@ -12,6 +12,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
 
@@ -331,11 +333,71 @@ std::vector<int64_t> ring(const std::string& kind, int& p0) {
   return kpos;
 }
 
+void benchmark_v4() {
+  constexpr int max_m = 8;
+  constexpr int context = 262144;
+  constexpr int repeats = 24;
+  DeviceArray<float> proj(size_t(max_m) * 8664), q(HQ * D), rel(HQ * DREL), rel_proj(DREL * EXT),
+      k_conv(4 * C), v_conv(4 * C), conv_k(3 * C), conv_v(3 * C);
+  DeviceArray<uint8_t> k(size_t(context + max_m) * C),
+      v(size_t(context + max_m) * HKV * ingine::kernels::value4::kHeadBytes), work(attn::workspace_bytes(max_m));
+  DeviceArray<__nv_bfloat16> out(size_t(max_m) * HQ * D);
+  DeviceArray<int64_t> pos(1);
+  attn::DecodeArgs a{};
+  a.proj = proj.get();
+  a.q_scale = q.get();
+  a.r_scale = rel.get();
+  a.rel_proj = rel_proj.get();
+  a.k_conv = k_conv.get();
+  a.v_conv = v_conv.get();
+  a.conv_k_state = conv_k.get();
+  a.conv_v_state = conv_v.get();
+  a.k_cache = k.get();
+  a.v_cache = v.get();
+  a.pos = pos.get();
+  a.cache_rows = context + max_m;
+  a.cache_fp8 = true;
+  a.cache_v4 = true;
+  a.log_scaling = true;
+  a.workspace = work.get();
+  a.workspace_size = work.count;
+  a.out = out.get();
+  cudaEvent_t start, end;
+  INGINE_TEST_CUDA(cudaEventCreate(&start));
+  INGINE_TEST_CUDA(cudaEventCreate(&end));
+  std::printf("occupied_tokens,verify_width,median_us\n");
+  for (const int size : {2048, 16384, 65536, 131072, 262144}) {
+    pos.upload({size});
+    for (const int width : {1, 2, 4, 8}) {
+      a.M = width;
+      for (int warmup = 0; warmup < 6; ++warmup) attn::attn_decode(a, g_stream);
+      INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
+      std::array<float, 7> elapsed{};
+      for (auto& ms : elapsed) {
+        INGINE_TEST_CUDA(cudaEventRecord(start, g_stream));
+        for (int i = 0; i < repeats; ++i) attn::attn_decode(a, g_stream);
+        INGINE_TEST_CUDA(cudaEventRecord(end, g_stream));
+        INGINE_TEST_CUDA(cudaEventSynchronize(end));
+        INGINE_TEST_CUDA(cudaEventElapsedTime(&ms, start, end));
+      }
+      std::sort(elapsed.begin(), elapsed.end());
+      std::printf("%d,%d,%.3f\n", size, width, elapsed[elapsed.size() / 2] * 1000 / repeats);
+    }
+  }
+  INGINE_TEST_CUDA(cudaEventDestroy(end));
+  INGINE_TEST_CUDA(cudaEventDestroy(start));
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   if (skip_without_gpu()) return kSkip;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-v4") == 0) {
+    benchmark_v4();
+    INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
+    return 0;
+  }
   Rng rng(4242);
   bool ok = true;
   for (const char* kind : {"empty", "partial", "wrapped", "stale"})
