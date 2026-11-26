@@ -51,6 +51,8 @@ The trial used short prompts for decode and a separate 20K-token prefill probe. 
 
 The 5080 launcher defaults to the 64K FP8 profile. Select `TWINKLING_PROFILE=128k` or `TWINKLING_PROFILE=256k` to use the corresponding text-only placement recipe with the original model behavior and all experts retained. A 256K slot reserves capacity and processes the tokens actually sent. Keep a session's prefix identical and append new turns to reuse its checkpoint.
 
+The tuned 128K preset uses 4,096-row prefill chunks and about 8.65 GiB of GPU-resident experts. In the paired tests on a quiet 250 W RTX 5080, it reduced first-token time on a 32,758-token prompt from 17.3 s to 9.9 s. Both 124,999-token coding outputs passed the same six functional checks, with the tuned recipe finishing in 58.9 s versus 94.2 s. A near-full tool and exact recall workflow passed with 742 MiB of observed GPU headroom.
+
 `TWINKLING_KV=v4` keeps FP8 global keys and compresses global values to INT4. `TWINKLING_PREFILL_CHUNK` supports up to 4,096 rows, trading scratch memory for fewer expert transfers. `TWINKLING_PREFILL_OVERLAP=1` overlaps those transfers with attention work. `TWINKLING_PARK_HOST_MIB` sets an optional pinned host-memory budget for restoring displaced conversations.
 
 Use [qualify_long.py](benchmarks/rtx5080/qualify_long.py) against an isolated loopback server to check actual prompt depth, exact recall, coding, and tool round-trips. Test the intended placement and cache precision together and check free VRAM during both load and generation.

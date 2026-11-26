@@ -19,7 +19,7 @@ fi
 
 case "$profile" in
   64k) capacity=65536; width=2048; precision=fp8; overlap=0; experts=rtx5080-experts.json ;;
-  128k) capacity=131072; width=2048; precision=v4; overlap=1; experts=rtx5080-128k-experts.json ;;
+  128k) capacity=131072; width=4096; precision=v4; overlap=1; experts=rtx5080-128k-experts.json ;;
   256k) capacity=262144; width=4096; precision=v4; overlap=1; experts=rtx5080-256k-experts.json ;;
   *) echo 'TWINKLING_PROFILE must be 64k, 128k, or 256k.' >&2; exit 2 ;;
 esac
