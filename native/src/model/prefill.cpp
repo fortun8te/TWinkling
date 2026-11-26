@@ -79,24 +79,36 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   hid_ = f32(C * H), part_ = f32(C * H), y_ = f32(C * H), y2_ = f32(C * H);
   xin_ = bf16(3 * C * H), xm_ = bf16(C * H), xf_ = bf16(C * H);
   mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H), mixm_ = f32(C * H);
-  proj_ = bf16(C * PROJ_ROWS_FULL);
-  q_ = bf16(C * HEADS * HEAD_DIM), rel16_ = bf16(C * HEADS * D_REL), rel_ = bf16(C * HEADS * REL_EXTENT);
+  // All three phases are ordered on stream_: the gates finish before projection/attention,
+  // and attention finishes before the routed-expert products. Only the weight staging stream
+  // runs independently, and it uses stage_ exclusively.
+  const std::size_t rel_elements = C * HEADS * REL_EXTENT;
+  const std::size_t projection_elements = C * PROJ_ROWS_FULL;
+  const std::size_t gate_inputs = C * 3 * 2 * H;
+  const std::size_t gate_outputs = C * 4 * H;  // two FP32 rows per token, counted in BF16 elements
+  const std::size_t expert_activations = C * TOP_K * INTER;
+  const std::size_t expert_outputs = C * TOP_K * H;
+  static_assert(H % 2 == 0);  // gate_inputs is also aligned for FP32 scratch
+  auto* phase = bf16(std::max({rel_elements + projection_elements, gate_inputs + gate_outputs,
+                              expert_activations + expert_outputs}));
+  rel_ = phase;
+  proj_ = phase + rel_elements;
+  gin_ = phase;
+  fpre_ = reinterpret_cast<float*>(phase + gate_inputs);
+  gpre_ = fpre_ + C * H;
+  act_ = phase;
+  down_ = phase + expert_activations;
+  q_ = bf16(C * HEADS * HEAD_DIM), rel16_ = bf16(C * HEADS * D_REL);
   krows_ = bf16(std::size_t(kpos_rows_) * KV_DIM), vrows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
   kpos_ = i32(kpos_rows_);
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
   attn_out_ = bf16(C * HEADS * HEAD_DIM), wo_out_ = bf16(C * H);
   g16_ = bf16(C * GATE_RANK);
-  // message-gate scratch lives in buffers dead while the gates run: gin_ in rel_ (written by rel_logits after
-  // the attention-side gates, dead before the MLP-side gate), fpre_/gpre_ in down_ (written by the experts after
-  // both gates)
-  static_assert(3 * 2 * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 && 2 * HIDDEN * 4 <= TOP_K * HIDDEN * 2);
   router_logits_ = f32(C * EXPERTS), wts_ = f32(C * TOP_K);
   idx_ = i32(C * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(C * TOP_K), pair_dst_ = i32(C * TOP_K);
   tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
-  act_ = bf16(C * TOP_K * INTER), down_ = bf16(C * TOP_K * H), moe_sum_ = bf16(C * H);
-  gin_ = rel_;
-  fpre_ = reinterpret_cast<float*>(down_), gpre_ = fpre_ + C * H;
+  moe_sum_ = bf16(C * H);
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
