@@ -155,6 +155,18 @@ __device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
     return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
 }
 
+__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint16_t pair) {
+#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2)
+    uint32_t result;
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(result) : "h"(pair));
+    return result;
+#else
+    const float2 f = e4m3x2_f2(pair);
+    const __nv_bfloat162 value = __floats2bfloat162_rn(f.x, f.y);
+    return *reinterpret_cast<const uint32_t*>(&value);
+#endif
+}
+
 // 8 E4M3 values (dims 8c..8c+7, byte 0 = lowest dim)
 __device__ __forceinline__ void unpack8(const uint2 u, float f[8]) {
     float2 a = e4m3x2_f2(u.x & 0xffffu), b = e4m3x2_f2(u.x >> 16);
@@ -875,10 +887,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                         const char* kr = kraw + key * D + ((ks ^ (key & 7)) * 16) + 4 * t4;
                         const uint32_t u0 = *reinterpret_cast<const uint32_t*>(kr);
                         const uint32_t u1 = *reinterpret_cast<const uint32_t*>(kr + 8 * D);
-                        const float2 f0 = e4m3x2_f2(u0 & 0xffffu), f1 = e4m3x2_f2(u1 & 0xffffu);
-                        const float2 f2 = e4m3x2_f2(u0 >> 16), f3 = e4m3x2_f2(u1 >> 16);
-                        af[0] = pack2(f0.x, f0.y), af[1] = pack2(f1.x, f1.y);
-                        af[2] = pack2(f2.x, f2.y), af[3] = pack2(f3.x, f3.y);
+                        // Every finite E4M3 key is exactly representable in BF16.
+                        af[0] = e4m3x2_bf16x2(uint16_t(u0)), af[1] = e4m3x2_bf16x2(uint16_t(u1));
+                        af[2] = e4m3x2_bf16x2(uint16_t(u0 >> 16)), af[3] = e4m3x2_bf16x2(uint16_t(u1 >> 16));
                     } else {
                         const int q = lane >> 3, key = km * 16 + (q & 1) * 8 + (lane & 7);
                         ldsm_x4(smem_u32(kaddr(key, ks * 2 + (q >> 1))), af);
