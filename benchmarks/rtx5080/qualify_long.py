@@ -148,6 +148,8 @@ def request(args, prompt, output_limit, tools=None, followup=()):
                       'stream': True, 'stream_options': {'include_usage': True}}
     if args.top_p is not None:
         payload['top_p'] = args.top_p
+    if args.top_k is not None:
+        payload['top_k'] = args.top_k
     if tools:
         payload['tools'] = tools
     body = json.dumps(payload).encode()
@@ -325,6 +327,7 @@ def main():
     parser.add_argument('--effort', default='low')
     parser.add_argument('--temperature', type=float, default=0)
     parser.add_argument('--top-p', type=float)
+    parser.add_argument('--top-k', type=int)
     parser.add_argument('--output-tokens', type=int, default=512)
     parser.add_argument('--headroom', type=int, default=2048)
     parser.add_argument('--depth-tolerance', type=int, default=2048)
@@ -341,11 +344,12 @@ def main():
     if (args.output_tokens < 1 or args.repeat < 1 or args.headroom < args.output_tokens + 128
             or args.depth_tolerance < 1 or args.timeout <= 0
             or not 0 <= args.temperature <= 2 or (args.top_p is not None and not 0 < args.top_p <= 1)
+            or (args.top_k is not None and args.top_k < 0)
             or min(depths) < args.headroom + args.depth_tolerance + 1024
             or (args.tokens_per_row is not None and not 1 < args.tokens_per_row < 100)):
         parser.error('invalid repetition, timeout, output budget, calibration or depth range')
     ledger = {'model': args.model, 'effort': args.effort, 'temperature': args.temperature,
-              'top_p': args.top_p, 'output_cap': args.output_tokens,
+              'top_p': args.top_p, 'top_k': args.top_k, 'output_cap': args.output_tokens,
               'endpoint': args.url, 'seed': args.seed, 'depths': depths, 'mode': args.mode,
               'headroom': args.headroom, 'depth_tolerance': args.depth_tolerance, 'records': []}
     cases = args.case or ['recall', 'code', 'decode', 'tool']
