@@ -144,8 +144,10 @@ def check_code(value):
 def request(args, prompt, output_limit, tools=None, followup=()):
     messages = [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': prompt}]
     payload = {'model': args.model, 'messages': messages + list(followup), 'max_tokens': output_limit,
-                      'temperature': 0, 'seed': args.seed, 'reasoning_effort': args.effort,
+                      'temperature': args.temperature, 'seed': args.seed, 'reasoning_effort': args.effort,
                       'stream': True, 'stream_options': {'include_usage': True}}
+    if args.top_p is not None:
+        payload['top_p'] = args.top_p
     if tools:
         payload['tools'] = tools
     body = json.dumps(payload).encode()
@@ -321,6 +323,8 @@ def main():
     parser.add_argument('--repeat', type=int, default=1)
     parser.add_argument('--seed', type=int, default=5080)
     parser.add_argument('--effort', default='low')
+    parser.add_argument('--temperature', type=float, default=0)
+    parser.add_argument('--top-p', type=float)
     parser.add_argument('--output-tokens', type=int, default=512)
     parser.add_argument('--headroom', type=int, default=2048)
     parser.add_argument('--depth-tolerance', type=int, default=2048)
@@ -336,10 +340,12 @@ def main():
     depths = args.depth or ([16384, 65536, 131072, 262144] if args.ramp else [131072, 262144])
     if (args.output_tokens < 1 or args.repeat < 1 or args.headroom < args.output_tokens + 128
             or args.depth_tolerance < 1 or args.timeout <= 0
+            or not 0 <= args.temperature <= 2 or (args.top_p is not None and not 0 < args.top_p <= 1)
             or min(depths) < args.headroom + args.depth_tolerance + 1024
             or (args.tokens_per_row is not None and not 1 < args.tokens_per_row < 100)):
         parser.error('invalid repetition, timeout, output budget, calibration or depth range')
-    ledger = {'model': args.model, 'effort': args.effort, 'output_cap': args.output_tokens,
+    ledger = {'model': args.model, 'effort': args.effort, 'temperature': args.temperature,
+              'top_p': args.top_p, 'output_cap': args.output_tokens,
               'endpoint': args.url, 'seed': args.seed, 'depths': depths, 'mode': args.mode,
               'headroom': args.headroom, 'depth_tolerance': args.depth_tolerance, 'records': []}
     cases = args.case or ['recall', 'code', 'decode', 'tool']
