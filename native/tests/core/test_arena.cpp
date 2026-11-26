@@ -6,6 +6,8 @@
 #include "core/tensor.h"
 #include "core/vmm.h"
 
+#include <cuda.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -126,7 +128,14 @@ void test_buffers() {
 void test_growable_buffer() {
     int device = 0, supported = 0;
     INGINE_TEST_CUDA(cudaGetDevice(&device));
-    INGINE_TEST_CUDA(cudaDeviceGetAttribute(&supported, cudaDevAttrVirtualMemoryManagementSupported, device));
+    void* entry = nullptr;
+    cudaDriverEntryPointQueryResult query{};
+    INGINE_TEST_CUDA(cudaGetDriverEntryPointByVersion("cuDeviceGetAttribute", &entry, 12000,
+                                                    cudaEnableDefault, &query));
+    INGINE_CHECK(query == cudaDriverEntryPointSuccess && entry);
+    const auto get_attribute = reinterpret_cast<decltype(&cuDeviceGetAttribute)>(entry);
+    INGINE_CHECK(get_attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                               device) == CUDA_SUCCESS);
     if (!supported) {
         std::printf("skip growable buffer: device VMM unavailable\n");
         return;
