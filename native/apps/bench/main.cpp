@@ -145,7 +145,8 @@ int main(int argc, char** argv) {
   int spec_shortlist_rows = 32768;
   int prefill_chunk = 3072, prefill_stage_mib = 0;
   std::string expert_plan;
-  double spec_threshold = 0.8, temperature = 0.0;
+  double spec_threshold = 0.8, temperature = 0.0, top_p = 1.0;
+  int top_k = 0;
 
   ingine::serve::ArgParser ap("ingine-bench",
                               "End-to-end ingine speed: prefill tokens/s and greedy decode tokens/s for one request.");
@@ -166,6 +167,8 @@ int main(int argc, char** argv) {
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--temperature", "", "", &temperature);
+  ap.option("--top-p", "", "nucleus cutoff for free benchmark sampling", &top_p);
+  ap.option("--top-k", "", "top-k cutoff for free benchmark sampling", &top_k);
   ap.option("--prefill-chunk", "", "", &prefill_chunk);
   ap.flag("--embed-host", "token embedding in pinned host memory", &embed_host);
   ap.option("--expert-plan", "", "routed-expert placement JSON", &expert_plan);
@@ -179,6 +182,10 @@ int main(int argc, char** argv) {
   ap.option("--forced-trace", "", "append every replayed item and round to FILE (JSON lines)", &forced_trace);
   ap.option("--forced-free", "", "with --forced: sample freely from each item's prompt with this seed (no replay)", &forced_free);
   ap.parse(argc, argv);
+  if (!(top_p > 0 && top_p <= 1) || top_k < 0) {
+    std::cerr << "ingine-bench: --top-p must be in (0,1] and --top-k nonnegative\n";
+    return 2;
+  }
   if ((suffix_draft && !spec) || spec_shortlist_rows < 1 || spec_shortlist_rows > 32768) {
     std::cerr << "ingine-bench: --suffix-draft requires --spec, and --draft-shortlist must be in 1..32768\n";
     return 2;
@@ -214,7 +221,8 @@ int main(int argc, char** argv) {
     std::printf("load+capture %.1fs, GPU %.2f GB\n", load_s, double(free0 > free1 ? free0 - free1 : 0) / 1e9);
     std::fflush(stdout);
     if (!forced.empty()) {
-      std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items, forced_trace, forced_free).c_str());
+      std::printf("%s\n", ingine::bench::run_forced(*gen, forced, temperature, forced_skip, forced_items,
+                                                  forced_trace, forced_free, top_p, top_k).c_str());
       return 0;
     }
 

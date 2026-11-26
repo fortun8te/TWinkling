@@ -14,6 +14,7 @@ namespace {
 
 constexpr int kMaxWidth = 8;
 constexpr std::array<int, 3> kVerifyWidths = {2, 4, 8};
+constexpr std::size_t kExpertRouteBytes = std::size_t(NUM_VISITS) * kMaxWidth * TOP_K * sizeof(int);
 
 DeviceBuffer device_copy(const Tensor& t, cudaStream_t stream) {
   DeviceBuffer b(t.bytes());
@@ -88,6 +89,28 @@ void Runtime::init() {
   CUDA_CHECK(cudaStreamCreateWithFlags(&capture_stream_, cudaStreamNonBlocking));
   for (cudaEvent_t& e : chain_done_) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
   chain_host_ = MappedHostBuffer(2 * sizeof(std::int32_t));
+  if (options.profile_experts) {
+    expert_routes_ = DeviceBuffer(kExpertRouteBytes);
+    expert_routes_.fill(0);
+    expert_routes_host_ = std::make_unique<PinnedHostBuffer>(kExpertRouteBytes);
+    expert_host_bytes_.resize(LAYERS);
+    for (int l = 0; l < LAYERS; ++l) {
+      const auto& ex = weights_.layers[l].experts;
+      for (const Tensor* tensor : {&ex.w13, &ex.w13_scale, &ex.w2, &ex.w2_scale}) {
+        const auto mapping = std::find_if(weights_.tiered.begin(), weights_.tiered.end(),
+                                          [tensor](const auto& span) { return span.data() == tensor->data; });
+        if (mapping == weights_.tiered.end()) continue;  // standalone device allocation
+        // Mappings round up the device boundary independently for each tensor. An expert may straddle it.
+        const std::size_t stride = tensor->bytes() / EXPERTS;
+        const std::size_t device_bytes = mapping->device_bytes();
+        for (int e = 0; e < weights_.experts_keep[l]; ++e) {
+          const std::size_t offset = std::size_t(e) * stride;
+          const std::size_t on_device = offset < device_bytes ? std::min(stride, device_bytes - offset) : 0;
+          expert_host_bytes_[l][e] += stride - on_device;
+        }
+      }
+    }
+  }
   for (int i = 0; i < 2; ++i) {
     undo_storage_[i] = DeviceBuffer(kUndoBytes);
     Carve c{static_cast<char*>(undo_storage_[i].p)};
@@ -157,12 +180,13 @@ void Runtime::capture(int m, bool history) {
   // conv states and ring positions are undone afterwards (the cache rows it wrote are never valid)
   const Snapshot saved = snapshot();
   Buffers& b = buffers(m);
-  for (int i = 0; i < 2; ++i) decoder_->decode(b, pos(), history, stream_);
+  auto* expert_routes = static_cast<int*>(expert_routes_.p);
+  for (int i = 0; i < 2; ++i) decoder_->decode(b, pos(), history, stream_, expert_routes);
   CUDA_CHECK(cudaStreamSynchronize(stream_));
   cudaGraph_t graph = nullptr;
   CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
   try {
-    decoder_->decode(b, pos(), history, stream_);
+    decoder_->decode(b, pos(), history, stream_, expert_routes);
   } catch (...) {
     cudaStreamEndCapture(stream_, &graph);
     if (graph) cudaGraphDestroy(graph);
@@ -194,7 +218,7 @@ const float* Runtime::run_step(int m) {
 
 const float* Runtime::run_step_eager(int m) {
   Buffers& b = buffers(m);
-  decoder_->decode(b, pos(), history_.at(m), stream_);
+  decoder_->decode(b, pos(), history_.at(m), stream_, static_cast<int*>(expert_routes_.p));
   return static_cast<const float*>(b.logits.data);
 }
 
@@ -332,7 +356,47 @@ void Runtime::rollback(int P, int commit, int m) {
 
 void Runtime::record_step(int m, cudaStream_t stream) {
   if (!graphs_.count(m)) throw std::invalid_argument("record_step: no decode graph for width " + std::to_string(m));
-  decoder_->decode(buffers(m), pos(), history_.at(m), stream);
+  decoder_->decode(buffers(m), pos(), history_.at(m), stream, static_cast<int*>(expert_routes_.p));
+}
+
+void Runtime::stage_expert_routes() {
+  if (!expert_routes_host_) return;
+  CUDA_CHECK(cudaMemcpyAsync(expert_routes_host_->data(), expert_routes_.p, kExpertRouteBytes,
+                             cudaMemcpyDeviceToHost, stream_));
+}
+
+void Runtime::count_expert_routes(int width, int committed, ExpertRouteStats& totals) const {
+  if (!expert_routes_host_) return;
+  if (!has_width(width) || committed < 0 || committed > width)
+    throw std::invalid_argument("count_expert_routes: invalid decode width or committed rows");
+  const auto* ids = static_cast<const int*>(expert_routes_host_->data());
+  ++totals.rounds;
+  for (const auto& visit : VISITS) {
+    const int layer = visit.layer;
+    const int keep = weights_.experts_keep[layer];
+    std::array<bool, EXPERTS> seen{};
+    for (int pair = 0; pair < width * TOP_K; ++pair) {
+      const int id = *ids++;
+      const bool kept_row = pair < committed * TOP_K;
+      if (id < 0 || id >= keep) {
+        ++totals.invalid_pairs;
+        continue;
+      }
+      const std::size_t host_bytes = expert_host_bytes_[layer][id];
+      if (!host_bytes) {
+        ++totals.device_pairs;
+        totals.committed_device_pairs += kept_row;
+      } else {
+        ++totals.host_pairs;
+        totals.committed_host_pairs += kept_row;
+        totals.host_logical_bytes += host_bytes;
+        if (!seen[id]) {
+          seen[id] = true;
+          totals.host_unique_logical_bytes += host_bytes;
+        }
+      }
+    }
+  }
 }
 
 void Runtime::record_save_verify(int m, cudaStream_t stream) {

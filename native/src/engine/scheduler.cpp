@@ -5,6 +5,7 @@
 #include <cxxabi.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -190,12 +191,21 @@ void Scheduler::run(Job& job) {
                         st.decode_seconds);
     if (!st.spec_trace.empty()) {
       double verify_ms = 0, draft_ms = 0;
+      std::array<int, 9> widths{};
       for (const auto& round : st.spec_trace) {
         verify_ms += round.verify_ms;
         draft_ms += round.draft_ms;
+        if (round.width > 0 && round.width < int(widths.size())) ++widths[round.width];
       }
-      server_log().info("{}: spec_profile rounds={} verify_total_ms={:.3f} draft_total_ms={:.3f}",
-                        job.id, st.spec_trace.size(), verify_ms, draft_ms);
+      server_log().info("{}: spec_profile rounds={} verify_total_ms={:.3f} draft_total_ms={:.3f} width_1={} width_2={} width_4={} width_8={}",
+                        job.id, st.spec_trace.size(), verify_ms, draft_ms, widths[1], widths[2], widths[4], widths[8]);
+    }
+    if (const auto& routes = st.expert_routes; routes.rounds) {
+      server_log().info("{}: expert_profile rounds={} device_pairs={} host_pairs={} invalid_pairs={} "
+                        "committed_device_pairs={} committed_host_pairs={} host_logical_bytes={} host_unique_logical_bytes={}",
+                        job.id, routes.rounds, routes.device_pairs, routes.host_pairs, routes.invalid_pairs,
+                        routes.committed_device_pairs, routes.committed_host_pairs, routes.host_logical_bytes,
+                        routes.host_unique_logical_bytes);
     }
     if (!job.images.empty()) {  // images: all of the prompt, those the vision tower encoded now, its time
       server_log().info("{}: images={} image_tokens={} encoded={} vit={:.3f}s", job.id, job.images.size(),

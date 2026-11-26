@@ -135,7 +135,7 @@ struct Item {
 // accepts it with min(1, p/q)), so sampled A/B needs these runs; the texts differ between builds, compare
 // several seeds.
 std::string run_free(model::Generator& gen, const std::string& path, const std::vector<Item>& list, double temperature,
-                     int seed, const std::string& trace_path) {
+                     int seed, const std::string& trace_path, double top_p, int top_k) {
   long items = 0, tokens = 0, rounds = 0, accepted = 0;
   double seconds = 0;
   for (const Item& it : list) {
@@ -143,6 +143,8 @@ std::string run_free(model::Generator& gen, const std::string& path, const std::
     model::Sampling sampling;
     sampling.temperature = float(temperature);
     sampling.seed = std::uint64_t(seed);
+    sampling.top_p = float(top_p);
+    sampling.top_k = top_k;
     const model::GenerateStats st = gen.generate(it.prompt, int(it.output.size()), sampling, {},
                                                  [](std::span<const std::int32_t>) { return true; });
     const long tok = st.generated_tokens - 1;  // the first token comes with the prefill
@@ -156,6 +158,10 @@ std::string run_free(model::Generator& gen, const std::string& path, const std::
       row["free_seed"] = seed;
       row["tokens"] = tok;
       row["seconds"] = st.decode_seconds;
+      row["prompt_tokens"] = st.prompt_tokens;
+      row["reused_tokens"] = st.reused_tokens;
+      row["generated_tokens"] = st.generated_tokens;
+      row["prefill_seconds"] = st.prefill_seconds;
       row["spec_rounds"] = st.spec_rounds;
       row["spec_accepted"] = st.spec_accepted;
       std::ofstream(trace_path, std::ios::app) << row.dump() << "\n";
@@ -171,6 +177,8 @@ std::string run_free(model::Generator& gen, const std::string& path, const std::
   j["items"] = items;
   j["free_seed"] = seed;
   j["temperature"] = temperature;
+  j["top_p"] = top_p;
+  j["top_k"] = top_k;
   j["total"]["tokens"] = tokens;
   j["total"]["tok_s"] = seconds > 0 ? double(tokens) / seconds : 0;
   if (rounds) {
@@ -187,7 +195,7 @@ std::string run_free(model::Generator& gen, const std::string& path, const std::
 }  // namespace
 
 std::string run_forced(model::Generator& gen, const std::string& path, double temperature, int skip, int items,
-                       const std::string& trace_path, int free_seed) {
+                       const std::string& trace_path, int free_seed, double top_p, int top_k) {
   std::ifstream in(path);
   if (!in) throw std::runtime_error("cannot open " + path);
   std::vector<Item> list;
@@ -199,7 +207,7 @@ std::string run_forced(model::Generator& gen, const std::string& path, double te
                     j.at("output").get<std::vector<std::int32_t>>()});
     if (items > 0 && int(list.size()) == items) break;
   }
-  if (free_seed >= 0) return run_free(gen, path, list, temperature, free_seed, trace_path);
+  if (free_seed >= 0) return run_free(gen, path, list, temperature, free_seed, trace_path, top_p, top_k);
 
   Totals total, kinds[NKINDS];
   std::vector<model::SpecRoundRecord> trace_all, trace_kind[NKINDS];

@@ -66,7 +66,7 @@ const std::int64_t* Decoder::block_table(const std::vector<const float*>& blocks
   return static_cast<const std::int64_t*>(it->second.p);
 }
 
-void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream) {
+void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream, int* expert_routes) {
   const int m = b.m;
   const int H = HIDDEN;
   const bool pdl = pdl_;
@@ -228,14 +228,15 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
                            static_cast<const __nv_bfloat16*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
                            layer.mlp1_gate_gain16.data, false, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr, pdl,
                            stream);
+    int* const idx = expert_routes ? expert_routes + std::size_t(v) * m * TOP_K : static_cast<int*>(b.idx.data);
     dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
-                  static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
+                  idx, f32m(b.wts), pdl, stream);
     const Experts& ex = layer.experts;
     const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
-    moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data, ex.w13_scale.data,
+    moe::moe_up(bf16m(b.xm), m, idx, ex.w13.data, ex.w13_scale.data,
                 f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);
     // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
-    moe::moe_down(bf16m(b.act), m, static_cast<const int*>(b.idx.data), f32p(b.wts), ex.w2.data, ex.w2_scale.data,
+    moe::moe_down(bf16m(b.act), m, idx, f32p(b.wts), ex.w2.data, ex.w2_scale.data,
                   f32p(ex.w2_factor), fmt, f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
                   history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, pdl, stream);
     prev_v = v;

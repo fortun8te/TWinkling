@@ -242,6 +242,8 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     (suffix_hit ? suffix_verify_ : verify_).launch(stream);
     (suffix_hit ? suffix_accept_ : accept_).launch(stream);
     if (!greedy) kh::sample_from_probs(scratch.resid, 1, V, V, rng, &record_dev->next, stream);
+    const bool trace_experts = rt_.options().profile_experts;
+    if (trace_experts) rt_.stage_expert_routes();
     CUDA_CHECK(cudaEventRecord(done_, stream));
     if (trace_rounds) record_event(1);
     // A cold lookup path goes back to the normal pipelined DSpark path
@@ -254,6 +256,7 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
     std::memcpy(&r, record, sizeof r);
     const int acc = r.accepted;
     const int commit = acc + 1;
+    if (trace_experts) rt_.count_expert_routes(r.m, commit, stats.expert_routes);
     round_P = P;
     round_m = r.m;
     round_acc = acc;

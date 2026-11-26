@@ -66,7 +66,8 @@ class Decoder {
   // fast.FastDecoder.decode: runs b.m consecutive tokens b.token at positions *pos, *pos + 1, ...;
   // logits in b.logits, taps in b.taps, conv inputs in b.hist_* when `history`. Graph capturable once it
   // ran eagerly for `b` (pointer tables are built on first use).
-  void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream);
+  // With expert_routes, the router outputs use one [NUM_VISITS, m, TOP_K] device buffer.
+  void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream, int* expert_routes = nullptr);
 
  private:
   const std::int64_t* block_table(const std::vector<const float*>& blocks);
@@ -186,6 +187,11 @@ class Runtime {
   void record_rollback(int m, const std::int32_t* accepted, cudaStream_t stream);
   std::int64_t* tokens() { return static_cast<std::int64_t*>(token_.p); }  // the shared int64 [8] input tokens
 
+  // Diagnostic: enqueue a pinned-host copy after the target graph. Count only after that copy completes
+  // and before staging another round. `committed` includes the anchor and verified drafts kept.
+  void stage_expert_routes();
+  void count_expert_routes(int width, int committed, ExpertRouteStats& totals) const;
+
  private:
   void init();
   void capture(int m, bool history);
@@ -210,6 +216,9 @@ class Runtime {
   MappedHostBuffer chain_host_;  // int32 [2]: tokens published by chain_advance, by position parity
   std::array<cudaEvent_t, 2> chain_done_{};
   cudaStream_t capture_stream_ = nullptr;
+  DeviceBuffer expert_routes_;
+  std::unique_ptr<PinnedHostBuffer> expert_routes_host_;
+  std::vector<std::array<std::size_t, EXPERTS>> expert_host_bytes_;
 };
 
 // The Generator (make_generator) over given weights and ablation, for tests: plain decoding only

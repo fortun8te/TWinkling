@@ -22,6 +22,6 @@ namespace ingine::bench {
 // "spec_accepted"}). This measures sampled decoding, where a forced replay under-counts acceptance (equality
 // with the recorded token instead of min(1, p/q)); the generated texts differ between builds and seeds.
 std::string run_forced(model::Generator& gen, const std::string& path, double temperature, int skip, int items,
-                       const std::string& trace_path, int free_seed = -1);
+                       const std::string& trace_path, int free_seed = -1, double top_p = 1, int top_k = 0);
 
 }  // namespace ingine::bench

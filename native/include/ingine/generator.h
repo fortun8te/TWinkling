@@ -71,13 +71,21 @@ struct SpecRoundRecord {
   float verify_ms = 0, draft_ms = 0;
 };
 
+struct ExpertRouteStats {
+  std::uint64_t rounds = 0;
+  std::uint64_t device_pairs = 0, host_pairs = 0, invalid_pairs = 0;
+  std::uint64_t committed_device_pairs = 0, committed_host_pairs = 0;
+  std::uint64_t host_logical_bytes = 0, host_unique_logical_bytes = 0;
+};
+
 struct GenerateStats {
   int prompt_tokens = 0, reused_tokens = 0, generated_tokens = 0;
   Reuse reuse = Reuse::None;
   double prefill_seconds = 0, decode_seconds = 0;
   int spec_rounds = 0, spec_accepted = 0;
   int spec_suffix_rounds = 0, spec_suffix_accepted = 0;
-  std::vector<SpecRoundRecord> spec_trace;  // forced replay only
+  std::vector<SpecRoundRecord> spec_trace;
+  ExpertRouteStats expert_routes;
   // Images: tokens of the prompt's images, how many images the vision tower encoded for this request (those
   // not inside the reused prefix) and its time (part of prefill_seconds).
   int image_tokens = 0, images_encoded = 0;
@@ -92,6 +100,7 @@ struct RuntimeOptions {
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
   float spec_threshold = 0.8f;
   bool profile_spec = false;
+  bool profile_experts = false;
   int spec_shortlist_rows = 32768;
   bool suffix_draft = false;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
