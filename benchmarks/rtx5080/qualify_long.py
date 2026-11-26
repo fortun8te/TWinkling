@@ -222,7 +222,7 @@ def request(args, prompt, output_limit, tools=None, followup=()):
             'tool_calls': [calls[index] for index in sorted(calls)]}
 
 
-def tool_round_trip(args, prompt, expected, depth, output_limit):
+def tool_round_trip(args, prompt, expected, depth, output_limit, recall_expected=None):
     tools = [LOOKUP_TOOL]
     first = request(args, prompt, output_limit, tools=tools)
     calls = first['tool_calls']
@@ -248,6 +248,20 @@ def tool_round_trip(args, prompt, expected, depth, output_limit):
     first['tool_round_trip_pass'] = (first['usage']['prompt_tokens'] < final['usage']['prompt_tokens'] <= depth - output_limit
                                     and final['finish'] == 'stop' and not final['tool_calls']
                                     and final['output'].strip() == expected['release'])
+    if recall_expected is not None:
+        first['recall_followup_pass'] = False
+        if first['tool_round_trip_pass']:
+            recall_history = followup + [
+                {'role': 'assistant', 'content': final['output']},
+                {'role': 'user', 'content': 'Now return a JSON object with the three approved archive keys. '
+                                           'Use exactly the fields north, central, and south. Do not call a tool.'},
+            ]
+            recall = request(args, prompt, output_limit, tools=tools, followup=recall_history)
+            first['recall_followup'] = recall
+            first['workflow_s'] = first['tool_round_trip_s'] + recall['total_s']
+            first['recall_followup_pass'] = (final['usage']['prompt_tokens'] < recall['usage']['prompt_tokens']
+                                            <= depth - output_limit and not recall['tool_calls']
+                                            and check_answer('recall', recall, recall_expected, output_limit))
     return first
 
 
@@ -272,7 +286,7 @@ def save(path, ledger):
 
 def check_answer(kind, reply, expected, output_limit):
     if kind == 'tool':
-        return reply['tool_round_trip_pass']
+        return reply['tool_round_trip_pass'] and reply.get('recall_followup_pass', True)
     if kind == 'decode':
         return (reply['usage']['completion_tokens'] >= output_limit * 0.80
                 and len(set(re.findall(r'\b\w+\b', reply['output'].lower()))) >= 60)
@@ -293,6 +307,7 @@ def main():
     parser.add_argument('--depth', type=int, action='append', help='allocated window in tokens, repeatable')
     parser.add_argument('--ramp', action='store_true', help='use 16K, 64K, 128K, and 256K when no --depth is given')
     parser.add_argument('--case', choices=('recall', 'code', 'decode', 'tool'), action='append')
+    parser.add_argument('--follow-recall', action='store_true', help='append exact long-context recall to the tool workflow')
     parser.add_argument('--mode', choices=('cold', 'both'), default='both',
                         help='cold only, or repeat the same document with a changed query')
     parser.add_argument('--repeat', type=int, default=1)
@@ -343,7 +358,8 @@ def main():
                            'token_overhead': overhead, 'ok': False}
                     try:
                         if kind == 'tool':
-                            reply = tool_round_trip(args, prompt, expected, depth, args.output_tokens)
+                            recall_expected = document(rows, 'recall', seed)[1] if args.follow_recall else None
+                            reply = tool_round_trip(args, prompt, expected, depth, args.output_tokens, recall_expected)
                         else:
                             reply = request(args, prompt, args.output_tokens)
                         tokens = reply['usage']['prompt_tokens']
