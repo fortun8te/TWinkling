@@ -342,7 +342,14 @@ class EngineGenerator final : public Generator {
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
                      drafter_ ? &taps : nullptr, rows);
       if (drafter_) {
-        drafter_->note_tokens(ids.subspan(s, std::size_t(T)));  // the prompt's tokens join the drafter's shortlist
+        // Only note the tail 6144 prompt tokens so long prompts do not fill CONTEXT_ROWS with early filler
+        // and lock out the end of the prompt + generated tokens.
+        const std::size_t tail_start = n > 6144 ? n - 6144 : 0;
+        const std::size_t chunk_end = s + std::size_t(T);
+        if (chunk_end > tail_start) {
+          const std::size_t lo = std::max(s, tail_start);
+          drafter_->note_tokens(ids.subspan(lo, chunk_end - lo));
+        }
         drafter_->commit(taps, int(s));
       }
     }

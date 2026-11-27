@@ -487,8 +487,8 @@ struct MainSmem {
     static constexpr int RAW = WK + (K4 ? KT * D / 2 : 0);            // NRAW * RAW_TILE_BYTES / 4 floats
     static constexpr int QB = (RAW + NRAW * RAW_TILE_BYTES / 4 + 3) & ~3;  // [NRP][D] bf16
     static constexpr int RELD = QB + NRP * D / 2;                     // [NRP][16] fp32
-    static constexpr int PS = RELD + NRP * DREL;                      // [2][NRP][PSTRIDE] fp16
-    static constexpr int ITM = PS + NRP * PSTRIDE;                    // [KT/16][NRP] float2
+    static constexpr int PS = RELD + NRP * DREL;                      // [NRP][PSTRIDE] scaled fp16 (single-pass)
+    static constexpr int ITM = PS + (NRP * PSTRIDE + 1) / 2;          // [KT/16][NRP] float2
     static constexpr int END = ITM + 2 * (KT / 16) * NRP;
     static constexpr size_t BYTES = size_t(END) * 4;
 };
@@ -727,13 +727,12 @@ __global__ void __launch_bounds__(NT, 2) splitk_main_tc_kernel(const Params p) {
             }
             mx0 = fmaxf(mx0, NEG_INIT), mx1 = fmaxf(mx1, NEG_INIT);
             float s0 = 0.f, s1 = 0.f;
+            constexpr float kPScale = 32768.f;
 #pragma unroll
             for (int v = 0; v < 4; ++v) {
                 const int key = km * 16 + gid + (v >> 1) * 8, row = r0 + (v & 1);
                 const float pf = exp2f(sv[v] - ((v & 1) ? mx1 : mx0));
-                const __half h = __float2half_rn(pf);
-                ps[row * PSTRIDE + key] = h;
-                ps[(NRP + row) * PSTRIDE + key] = __float2half_rn(pf - __half2float(h));
+                ps[row * PSTRIDE + key] = __float2half_rn(pf * kPScale);
                 ((v & 1) ? s1 : s0) += pf;
             }
 #pragma unroll
@@ -777,6 +776,7 @@ __global__ void __launch_bounds__(NT, 2) splitk_main_tc_kernel(const Params p) {
                 const int q = lane >> 3, key = ks * 16 + (q >> 1) * 8 + (lane & 7);
                 ldsm_x4_t(smem_u32(wv + roff(key, warp * 2 + (q & 1))), af);
             }
+            constexpr float kPUnscale = 1.f / 32768.f;
 #pragma unroll
             for (int n = 0; n < NTN; ++n) {
                 uint32_t bfr[2];
@@ -784,10 +784,8 @@ __global__ void __launch_bounds__(NT, 2) splitk_main_tc_kernel(const Params p) {
                 const __half* pr = ps + (n * 8 + (lane & 7)) * PSTRIDE + ks * 16 + ((lane >> 3) & 1) * 8;
                 ldsm_x2(smem_u32(pr), bfr);
                 mma_f16(acc_t, af, bfr);
-                ldsm_x2(smem_u32(pr + NRP * PSTRIDE), bfr);
-                mma_f16(acc_t, af, bfr);
 #pragma unroll
-                for (int v = 0; v < 4; ++v) oacc[n][v] = fmaf(f[ks][n][v & 1], acc_t[v], oacc[n][v]);
+                for (int v = 0; v < 4; ++v) oacc[n][v] = fmaf(f[ks][n][v & 1] * kPUnscale, acc_t[v], oacc[n][v]);
             }
         }
     }

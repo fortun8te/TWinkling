@@ -22,6 +22,7 @@
 #include "kernels/prefill/prefill.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ingine::kernels::prefill {
@@ -419,6 +420,322 @@ void launch(const AttnParams& p, cudaStream_t stream) {
   attn_kernel<FP8, EXPLICIT, V4, K4><<<grid, NT, sizeof(Smem), stream>>>(p);
 }
 
+// -----------------------------------------------------------------------------
+// Blackwell SM120a block-scaled FP8 MMA global prefill attention
+// (mxf8f6f4.block_scale.scale_vec::1X.m16n8k32, 4x BF16 tensor core throughput).
+// Supports FP8/FP8, FP8/V4, and K4/V4 global caches (EXPLICIT == false, window == 0).
+// -----------------------------------------------------------------------------
+namespace fp8_mma {
+
+constexpr float kPScale8 = 256.f, kPUnscale8 = 1.f / 256.f;
+
+struct Smem8 {
+  uint8_t k8[2][BK * D];
+  uint8_t v8[2][BK * D];
+  uint8_t vt[D * BK];
+};
+
+__device__ __forceinline__ int k8_off(int row, int unit) {
+  return row * D + ((unit ^ (row & 7)) << 4);
+}
+__device__ __forceinline__ int v8_off(int row, int unit) {
+  return row * D + ((unit ^ (((row >> 1) & 3) | ((row >> 2) & 4))) << 4);
+}
+__device__ __forceinline__ int vt_off(int dim, int unit) {
+  return dim * BK + ((unit ^ ((dim >> 1) & 3)) << 4);
+}
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+  uint32_t d;
+  asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel));
+  return d;
+}
+__device__ __forceinline__ uint32_t pack_e4m3x4(float a, float b, float c, float d) {
+  const uint16_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+  const uint16_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+  return uint32_t(lo) | (uint32_t(hi) << 16);
+}
+__device__ __forceinline__ uint32_t v4_quad_to_e4m3x4(uint32_t bits, float scale) {
+  const float f0 = float(int(bits & 15u) - 8) * scale;
+  const float f1 = float(int((bits >> 4) & 15u) - 8) * scale;
+  const float f2 = float(int((bits >> 8) & 15u) - 8) * scale;
+  const float f3 = float(int((bits >> 12) & 15u) - 8) * scale;
+  return pack_e4m3x4(f0, f1, f2, f3);
+}
+__device__ __forceinline__ void mma_fp8(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
+                                        uint32_t scale_a) {
+  asm("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %11}, {%12}, {%11, %11};"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(scale_a), "h"(uint16_t(0)),
+        "r"(0x7f7f7f7fu));
+}
+
+template <bool V4, bool K4>
+__device__ __forceinline__ void store_tile8(Smem8& s, int buf, const KvRegs<true>& r) {
+  const int tid = threadIdx.x;
+#pragma unroll
+  for (int i = 0; i < r.N; ++i) {
+    const int id = tid + i * NT, row = id >> 3, c = id & 7;
+    uint4 kv, vv;
+    if constexpr (K4) {
+      const float ks = __uint_as_float(r.k[i].z);
+      kv = make_uint4(v4_quad_to_e4m3x4(r.k[i].x, ks), v4_quad_to_e4m3x4(r.k[i].x >> 16, ks),
+                      v4_quad_to_e4m3x4(r.k[i].y, ks), v4_quad_to_e4m3x4(r.k[i].y >> 16, ks));
+    } else {
+      kv = r.k[i];
+    }
+    if constexpr (V4) {
+      const float vs = __uint_as_float(r.v[i].z);
+      vv = make_uint4(v4_quad_to_e4m3x4(r.v[i].x, vs), v4_quad_to_e4m3x4(r.v[i].x >> 16, vs),
+                      v4_quad_to_e4m3x4(r.v[i].y, vs), v4_quad_to_e4m3x4(r.v[i].y >> 16, vs));
+    } else {
+      vv = r.v[i];
+    }
+    *reinterpret_cast<uint4*>(&s.k8[buf][k8_off(row, c)]) = kv;
+    *reinterpret_cast<uint4*>(&s.v8[buf][v8_off(row, c)]) = vv;
+  }
+}
+
+template <bool V4, bool K4>
+__global__ void __launch_bounds__(NT, 1) attn_fp8_mma_kernel(const AttnParams p) {
+  extern __shared__ __align__(128) unsigned char smem_raw[];
+  Smem8& s = *reinterpret_cast<Smem8*>(smem_raw);
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int g = blockIdx.y;
+  const int rows = GQA * p.T;
+  const int R0 = (gridDim.x - 1 - blockIdx.x) * BR;
+
+  // Load & quantize Q rows directly to MXFP8 in registers (4 k=32 steps)
+  uint32_t qa8[D / 32][4];
+  uint32_t qs[D / 32];
+  int qpos[2];
+  const uint16_t* relp[2];
+  {
+    uint32_t sc_q[2][D / 32];
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int R = min(R0 + warp * 16 + (lane >> 2) + r * 8, rows - 1);
+      const int t = R / GQA, h = g * GQA + R % GQA;
+      qpos[r] = p.pos0 + t;
+      relp[r] = reinterpret_cast<const uint16_t*>(p.rel) + (size_t(t) * kHeads + h) * kRelExtent;
+      const uint16_t* qrow = reinterpret_cast<const uint16_t*>(p.q) + (size_t(t) * kHeads + h) * D + (lane & 3) * 4;
+#pragma unroll
+      for (int st = 0; st < D / 32; ++st) {
+        const uint2 lo = *reinterpret_cast<const uint2*>(qrow + 32 * st);
+        const uint2 hi = *reinterpret_cast<const uint2*>(qrow + 32 * st + 16);
+        const float x[8] = {bf_lo(lo.x), bf_hi(lo.x), bf_lo(lo.y), bf_hi(lo.y),
+                            bf_lo(hi.x), bf_hi(hi.x), bf_lo(hi.y), bf_hi(hi.y)};
+        float amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(x[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        const float raw = __fmul_rn(amax, 1.f / 448.f);
+        const int exp = max(((__float_as_int(raw) + 0x007fffff) & 0x7f800000) >> 23, 1);
+        const float inv = __int_as_float((254 - exp) << 23);
+        sc_q[r][st] = unsigned(exp);
+        qa8[st][r] = pack_e4m3x4(x[0] * inv, x[1] * inv, x[2] * inv, x[3] * inv);
+        qa8[st][2 + r] = pack_e4m3x4(x[4] * inv, x[5] * inv, x[6] * inv, x[7] * inv);
+      }
+    }
+#pragma unroll
+    for (int st = 0; st < D / 32; ++st) qs[st] = (lane & 1) ? sc_q[1][st] : sc_q[0][st];
+  }
+
+  const int qmin = p.pos0 + R0 / GQA;
+  const int qmax = p.pos0 + min(R0 + BR - 1, rows - 1) / GQA;
+  const int hi = min(qmax, p.L - 1);
+  const int ntiles = hi >= 0 ? hi / BK + 1 : 0;
+
+  float o[D / 8][4];
+#pragma unroll
+  for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+  float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+
+  KvRegs<true> regs;
+  if (ntiles > 0) {
+    load_tile<true, false, V4, K4>(p, g, 0, regs);
+    store_tile8<V4, K4>(s, 0, regs);
+  }
+  __syncthreads();
+
+#pragma unroll 1
+  for (int i = 0; i < ntiles; ++i) {
+    const int buf = i & 1;
+    if (i + 1 < ntiles) load_tile<true, false, V4, K4>(p, g, (i + 1) * BK, regs);
+
+    const int kmin = i * BK;
+    const int kmax = min(i * BK + BK - 1, p.L - 1);
+    const bool allv = i * BK + BK <= p.L;
+    const int dmin = qmin - kmax;
+    const bool need_mask = !(allv && dmin >= 0);
+    const bool need_bias = dmin < kRelExtent;
+
+    // ---- S = Q K^T (FP8 MMA, 4 steps of k=32)
+    float sc[BK / 8][4];
+#pragma unroll
+    for (int nt = 0; nt < BK / 8; ++nt) sc[nt][0] = sc[nt][1] = sc[nt][2] = sc[nt][3] = 0.f;
+    const uint8_t* Ks = s.k8[buf];
+#pragma unroll
+    for (int kk = 0; kk < D / 32; ++kk) {
+      unsigned b[BK / 16][4];
+#pragma unroll
+      for (int np = 0; np < BK / 16; ++np)
+        ldmatrix_x4(b[np][0], b[np][1], b[np][2], b[np][3],
+                    smem_addr(Ks + k8_off(np * 16 + (lane & 7) + ((lane >> 4) << 3), 2 * kk + ((lane >> 3) & 1))));
+#pragma unroll
+      for (int np = 0; np < BK / 16; ++np) {
+        mma_fp8(sc[2 * np], qa8[kk], b[np][0], b[np][1], qs[kk]);
+        mma_fp8(sc[2 * np + 1], qa8[kk], b[np][2], b[np][3], qs[kk]);
+      }
+    }
+
+    // Transpose V tile [64, 128] -> s.vt [128, 64] in MMA key order
+    {
+      const int t = lane & 3;
+      const int base_key = 32 * ((lane >> 3) & 1) + 16 * ((lane >> 2) & 1) + 2 * t;
+      const int position = 32 * ((lane >> 3) & 1) + 16 * ((lane >> 2) & 1) + 4 * t;
+#pragma unroll
+      for (int it = 0; it < 2; ++it) {
+        const int quad = 2 * (warp + NWARPS * it) + (lane >> 4);
+        uint32_t w[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int key = base_key + 8 * (j >> 1) + (j & 1);
+          w[j] = *reinterpret_cast<const uint32_t*>(&s.v8[buf][v8_off(key, quad >> 2) + 4 * (quad & 3)]);
+        }
+        const uint32_t t0 = prmt(w[0], w[1], 0x5140u);
+        const uint32_t t1 = prmt(w[2], w[3], 0x5140u);
+        const uint32_t t2 = prmt(w[0], w[1], 0x7362u);
+        const uint32_t t3 = prmt(w[2], w[3], 0x7362u);
+        const uint32_t out4[4] = {prmt(t0, t1, 0x5410u), prmt(t0, t1, 0x7632u), prmt(t2, t3, 0x5410u),
+                                  prmt(t2, t3, 0x7632u)};
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+          const int dim = 4 * quad + d;
+          *reinterpret_cast<uint32_t*>(&s.vt[vt_off(dim, position >> 4) + (position & 15)]) = out4[d];
+        }
+      }
+    }
+    if (i + 1 < ntiles) store_tile8<V4, K4>(s, buf ^ 1, regs);
+
+    // ---- scores (log2 units), bias, mask, online softmax
+    float rmax[2] = {m[0], m[1]};
+#pragma unroll
+    for (int nt = 0; nt < BK / 8; ++nt) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int r = e >> 1, jl = nt * 8 + (lane & 3) * 2 + (e & 1);
+        float x = sc[nt][e] * kScale;
+        if (need_mask || need_bias) {
+          const int kp = i * BK + jl;
+          const int d = qpos[r] - kp;
+          const bool ok = d >= 0 && kp < p.L;
+          if (need_bias && ok && d < kRelExtent) x += bf2f(__ldg(relp[r] + d));
+          x = ok ? x * kLog2e : -INFINITY;
+        } else {
+          x *= kLog2e;
+        }
+        sc[nt][e] = x;
+        rmax[r] = fmaxf(rmax[r], x);
+      }
+    }
+    float mref[2];
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(0xffffffffu, rmax[r], 1));
+      rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(0xffffffffu, rmax[r], 2));
+      mref[r] = rmax[r] == -INFINITY ? 0.f : rmax[r];
+      const float alpha = exp2f(m[r] - mref[r]);
+      m[r] = rmax[r];
+      l[r] *= alpha;
+#pragma unroll
+      for (int dt = 0; dt < D / 8; ++dt) {
+        o[dt][2 * r] *= alpha;
+        o[dt][2 * r + 1] *= alpha;
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < BK / 8; ++nt) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float pv = exp2f(sc[nt][e] - mref[e >> 1]);
+        l[e >> 1] += pv;
+        sc[nt][e] = pv * kPScale8;
+      }
+    }
+
+    __syncthreads();  // s.vt ready and s.k8/v8[buf^1] ready
+
+    // ---- O += P V (FP8 MMA, 2 steps of k=32)
+    uint32_t pa[BK / 32][4];
+#pragma unroll
+    for (int kk = 0; kk < BK / 32; ++kk) {
+      pa[kk][0] = pack_e4m3x4(sc[4 * kk][0], sc[4 * kk][1], sc[4 * kk + 1][0], sc[4 * kk + 1][1]);
+      pa[kk][1] = pack_e4m3x4(sc[4 * kk][2], sc[4 * kk][3], sc[4 * kk + 1][2], sc[4 * kk + 1][3]);
+      pa[kk][2] = pack_e4m3x4(sc[4 * kk + 2][0], sc[4 * kk + 2][1], sc[4 * kk + 3][0], sc[4 * kk + 3][1]);
+      pa[kk][3] = pack_e4m3x4(sc[4 * kk + 2][2], sc[4 * kk + 2][3], sc[4 * kk + 3][2], sc[4 * kk + 3][3]);
+    }
+#pragma unroll
+    for (int kk = 0; kk < BK / 32; ++kk) {
+#pragma unroll
+      for (int dp = 0; dp < D / 16; ++dp) {
+        uint32_t b[4];
+        const int dim = dp * 16 + (lane & 7) + 8 * (lane >> 4);
+        ldmatrix_x4(b[0], b[1], b[2], b[3], smem_addr(&s.vt[vt_off(dim, 2 * kk + ((lane >> 3) & 1))]));
+        mma_fp8(o[2 * dp], pa[kk], b[0], b[1], 0x7f7f7f7fu);
+        mma_fp8(o[2 * dp + 1], pa[kk], b[2], b[3], 0x7f7f7f7fu);
+      }
+    }
+    __syncthreads();  // wait before next tile overwrites s.vt
+  }
+
+  // ---- epilogue
+  const uint16_t* proj = reinterpret_cast<const uint16_t*>(p.proj);
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    float lr = l[r];
+    lr += __shfl_xor_sync(0xffffffffu, lr, 1);
+    lr += __shfl_xor_sync(0xffffffffu, lr, 2);
+    const int R = R0 + warp * 16 + (lane >> 2) + r * 8;
+    if (R >= rows) continue;
+    const int t = R / GQA, h = g * GQA + R % GQA;
+    const uint16_t* prow = proj + size_t(t) * p.ld;
+    const float lse = (m[r] + log2f(lr)) * kLn2;
+    const float factor = 1.f / (1.f + expf(-(lse - bf2f(prow[SINK_COL + h]))));
+    uint16_t* out = reinterpret_cast<uint16_t*>(p.out) + (size_t(t) * kHeads + h) * D;
+#pragma unroll
+    for (int dt = 0; dt < D / 8; ++dt) {
+      const int col = dt * 8 + (lane & 3) * 2;
+      const uint32_t gw = *reinterpret_cast<const uint32_t*>(prow + GATE_COL + h * D + col);
+      const float g0 = bf_lo(gw), g1 = bf_hi(gw);
+      const float a0 = round_bf16(o[dt][2 * r] * kPUnscale8 / lr * factor);
+      const float a1 = round_bf16(o[dt][2 * r + 1] * kPUnscale8 / lr * factor);
+      const float s0 = 1.f / (1.f + expf(-g0)), s1 = 1.f / (1.f + expf(-g1));
+      *reinterpret_cast<uint32_t*>(out + col) = pack_bf16x2(a0 * s0, a1 * s1);
+    }
+  }
+}
+
+template <bool V4, bool K4>
+void launch8(const AttnParams& p, cudaStream_t stream) {
+  static const cudaError_t attr =
+      cudaFuncSetAttribute(attn_fp8_mma_kernel<V4, K4>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem8)));
+  if (attr != cudaSuccess) throw std::runtime_error("prefill attention fp8_mma: shared memory attribute failed");
+  const dim3 grid((GQA * p.T + BR - 1) / BR, kKvHeads);
+  attn_fp8_mma_kernel<V4, K4><<<grid, NT, sizeof(Smem8), stream>>>(p);
+}
+
+bool fp8_mma_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("INGINE_PREFILL_FP8_ATTN");
+    return !e || std::atoi(e) != 0;
+  }();
+  return on;
+}
+
+}  // namespace fp8_mma
+
 // ---- sliding-visit key rows
 
 constexpr int kRowVecs = kKvDim * 2 / 16;  // 16-byte vectors per key row (128)
@@ -474,16 +791,20 @@ void attention(const AttnParams& p, cudaStream_t stream) {
   const bool expl = p.kpos != nullptr;
   if (expl && (!p.bounds || (p.L + BK - 1) / BK > kAttnMaxTiles))
     throw std::invalid_argument("prefill attention: explicit key tiles exceed the bounded layout or lack bounds");
+  const bool use_fp8_mma = !expl && p.window == 0 && p.kv_fp8 && p.L >= 4096 && fp8_mma::fp8_mma_enabled();
   if (p.kv_k4) {
     if (!p.kv_v4 || !p.kv_fp8 || expl || p.window != 0)
       throw std::invalid_argument("prefill attention: INT4 keys require K4/V4 on a full visit");
-    launch<true, false, true, true>(p, stream);
+    if (use_fp8_mma) fp8_mma::launch8<true, true>(p, stream);
+    else launch<true, false, true, true>(p, stream);
   } else if (p.kv_v4) {
     if (!p.kv_fp8 || expl || p.window != 0)
       throw std::invalid_argument("prefill attention: INT4 values require FP8 keys on a full visit");
-    launch<true, false, true, false>(p, stream);
+    if (use_fp8_mma) fp8_mma::launch8<true, false>(p, stream);
+    else launch<true, false, true, false>(p, stream);
   } else if (p.kv_fp8) {
     if (expl) launch<true, true>(p, stream);
+    else if (use_fp8_mma) fp8_mma::launch8<false, false>(p, stream);
     else launch<true, false>(p, stream);
   } else {
     if (expl) launch<false, true>(p, stream);

@@ -290,7 +290,7 @@ void verify_rollback(const StatePtrs& st, const VerifyBackup& bk, const float* c
 
 void verify_select(const float* conf, const std::int32_t* drafts, float threshold, const Widths& widths,
                    std::int64_t* token, std::int32_t* m_out, cudaGraphConditionalHandle handle, cudaStream_t stream) {
-  if (widths.n < 1 || widths.n > 3) throw std::invalid_argument("verify_select: 1 to 3 widths");
+  if (widths.n < 1 || widths.n > 8) throw std::invalid_argument("verify_select: 1 to 8 widths");
   verify_select_kernel<<<1, 32, 0, stream>>>(conf, drafts, threshold, widths, reinterpret_cast<long long*>(token),
                                              m_out, handle);
   CUDA_CHECK(cudaGetLastError());

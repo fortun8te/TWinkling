@@ -200,7 +200,9 @@ struct Weights {
   Tensor embed_norm;          // fp32 [H]
   Tensor final_query;         // fp32 [1, H]
   Tensor final_norm;          // fp32 [H] (also final_norm1 = [1, H] view of the same memory)
-  Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 rows + scales (dense_fp8)
+  Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 rows + scales (in mapped host RAM when lazy_head)
+  Tensor unembed_q4_codes;    // u8 [UNPADDED_VOCAB, H/2] in VRAM when lazy_head (group-32 INT4 proxy)
+  Tensor unembed_q4_scales;   // f16 [UNPADDED_VOCAB, H/32] in VRAM when lazy_head
   Tensor message_queries;     // fp32 [12, 4, H]: q, k, v, mlp per loop layer
   std::array<ExpertFormat, LAYERS> expert_formats{};
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows

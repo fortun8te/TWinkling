@@ -1,6 +1,7 @@
 // DSpark Markov head (dspark.Drafter._draft after the base logits): per-step top-1024 candidates, the
 // GRU-like cell, candidate logits with the folded hidden_out correction, greedy or Gumbel-max picks, and
 // the draft outputs. PDL launches (see block.cu).
+#include "kernels/common/race.cuh"
 #include "kernels/draft/draft.h"
 #include "kernels/draft/draft_device.cuh"
 

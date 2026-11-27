@@ -46,6 +46,13 @@ void sampling_probs(const float* logits, int rows, int V, std::int64_t stride, c
 void sample(const float* logits, int rows, int V, std::int64_t stride, const SamplingParams& params,
             SamplerRng& rng, std::int32_t* out, cudaStream_t stream);
 
+// Coupled exponential-race draw for speculative verification: row r draws for position (*pos_dev + 1 + r)
+// using the same race::boost(draw_key(*seed_dev, pos), token_id) as DSpark's markov_logits_kernel.
+// Exact target distribution (with top_k / top_p / temperature), CUDA-graph capturable.
+void sample_coupled(const float* logits, int rows, int V, std::int64_t stride, const SamplingParams& params,
+                    const std::uint64_t* seed_dev, const std::int64_t* pos_dev, std::int32_t* out,
+                    cudaStream_t stream);
+
 // out[r] = one draw from the non-negative weights probs[r] (torch.multinomial of the normalised row;
 // an all-zero row gives 0).
 void sample_from_probs(const float* probs, int rows, int V, std::int64_t stride, SamplerRng& rng,

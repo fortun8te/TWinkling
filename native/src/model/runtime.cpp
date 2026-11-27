@@ -120,11 +120,12 @@ void Runtime::init() {
     undo_[i].pos = c.take<std::int64_t>(NUM_SLIDING_VISITS);
   }
 
-  buffers_.emplace(1, make_buffers(1));
+  buffers_base_ = make_buffers(options.spec ? kMaxWidth : 1);
+  buffers_.emplace(1, alias_buffers(buffers_base_, 1));
   history_[1] = false;
   if (options.spec) {
     for (int w : kVerifyWidths) {
-      buffers_.emplace(w, make_buffers(w));
+      buffers_.emplace(w, alias_buffers(buffers_base_, w));
       history_[w] = true;
       verify_widths_.push_back(w);
     }

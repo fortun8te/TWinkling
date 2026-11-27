@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/safetensors.h"
 #include "kernels/draft/shortlist.h"
+#include "kernels/prefill/prefill.h"
 
 #include <algorithm>
 #include <cmath>
@@ -107,6 +108,8 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   warm_feats_ = bf16s(std::size_t(BLOCK) * 4 * H);
   ctx_c_ = bf16s(std::size_t(COMMIT_PIECE) * H);
   ctx_kv_ = bf16s(std::size_t(COMMIT_PIECE) * 2 * kd::KV_DIM);
+  ctx_xq_ = static_cast<uint8_t*>(alloc(std::size_t(COMMIT_PIECE) * H));
+  ctx_xs_ = static_cast<uint8_t*>(alloc(std::size_t(COMMIT_PIECE) * (H / 32)));
   commit_xin_ = bf16s(std::size_t(3) * BLOCK * H);
   commit_kv_ = f32s(std::size_t(BLOCK) * 3 * 2 * kd::KV_DIM);
   CUDA_CHECK(cudaMemsetAsync(warm_feats_, 0, std::size_t(BLOCK) * 4 * H * 2, stream_));
@@ -265,14 +268,9 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     return kdense::Matrix{q, scale, int(rows)};
   };
 
-  // the three layers' context k/v projections: BF16 for large commits (cuBLASLt), and one FP8-row matrix of
-  // all three for a small commit (one dense GEMV)
+  // the three layers' context k/v projections: one FP8-row matrix of all three (used for both small and large commits)
   {
     auto kv = [](int l, const char* x) { return "layers." + std::to_string(l) + ".self_attn." + x + "_proj_ctx.weight"; };
-    const std::vector<std::int64_t> shape{kd::KV_DIM, h};
-    const __nv_bfloat16* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
-                                        {kv(1, "v"), shape}, {kv(2, "k"), shape}, {kv(2, "v"), shape}});
-    for (int l = 0; l < 3; ++l) layers_[l].wkv_ctx = all + std::size_t(l) * 2 * kd::KV_DIM * H;
     wkv_all_ = fp8({{kv(0, "k"), kd::KV_DIM}, {kv(0, "v"), kd::KV_DIM}, {kv(1, "k"), kd::KV_DIM},
                     {kv(1, "v"), kd::KV_DIM}, {kv(2, "k"), kd::KV_DIM}, {kv(2, "v"), kd::KV_DIM}});
   }
@@ -450,7 +448,12 @@ void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_
   for (int l = 0; l < 3; ++l) {
     const DraftLayer& L = layers_[l];
     kd::mix_rmsnorm(feats, n, alpha_ + 4 * l, L.ctx_norm, ctx_c_, stream_);
-    gemm_.run(ctx_c_, n, L.wkv_ctx, 2 * kd::KV_DIM, H, ctx_kv_, stream_);
+    kernels::prefill::quantize_mxfp8(ctx_c_, n, H, ctx_xq_, ctx_xs_, stream_);
+    const std::size_t wrow = std::size_t(l) * 2 * kd::KV_DIM;
+    kernels::prefill::Fp8GemmProduct prod{
+        static_cast<const uint8_t*>(wkv_all_.w) + wrow * H, wkv_all_.scale + wrow,
+        ctx_xq_, ctx_xs_, ctx_kv_, 2 * kd::KV_DIM, 2 * kd::KV_DIM};
+    kernels::prefill::gemm_fp8_batch(&prod, 1, n, H, stream_);
     const int size = is_local(l) ? kd::WINDOW : ctx_;
     kd::ctx_kv_store(ctx_kv_, n, params_, row0, n - std::min(n, size), L.k_norm_ctx, L.k_ctx, L.v_ctx,
                      !is_local(l) && GLOBAL_FP8, size, L.ctx_pos, stream_);

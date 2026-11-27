@@ -156,6 +156,44 @@ Buffers make_buffers(int m) {
   return b;
 }
 
+Buffers alias_buffers(const Buffers& base, int m) {
+  if (m < 1 || m > base.m) throw std::invalid_argument("alias_buffers: m exceeds base.m");
+  Buffers b;
+  b.m = m;
+  const int H = HIDDEN;
+  auto view = [](const Tensor& t, std::initializer_list<std::int32_t> shape) { return rm(t.data, t.dtype, shape); };
+  b.token = view(base.token, {m});
+  b.B0 = view(base.B0, {m, H});
+  b.B1 = view(base.B1, {m, H});
+  for (int p = 0; p < PASSES; ++p) {
+    b.B2[p] = view(base.B2[p], {m, H});
+    b.E[p] = view(base.E[p], {m, H});
+  }
+  b.hid = view(base.hid, {m, H});
+  b.part = view(base.part, {m, H});
+  b.y = view(base.y, {m, H});
+  b.y2 = view(base.y2, {m, H});
+  b.xin = view(base.xin, {3, m, H});
+  b.mixf = view(base.mixf, {3, m, H});
+  b.msgs = view(base.msgs, {4, m, H});
+  b.xm = view(base.xm, {1, m, H});
+  b.mixm = view(base.mixm, {1, m, H});
+  b.proj_sliding = view(base.proj_sliding, {m, PROJ_ROWS_SLIDING});
+  b.proj_full = view(base.proj_full, {m, PROJ_ROWS_FULL});
+  b.attn_out = view(base.attn_out, {m, HEADS * HEAD_DIM});
+  b.idx = view(base.idx, {m, TOP_K});
+  b.wts = view(base.wts, {m, TOP_K});
+  b.act = view(base.act, {m, TOP_K, INTER});
+  b.xf = view(base.xf, {1, m, H});
+  b.logits = view(base.logits, {m, UNPADDED_VOCAB});
+  b.taps = view(base.taps, {m, NUM_TAPS, H});
+  b.hist_attn = view(base.hist_attn, {NUM_VISITS, m, H});
+  b.hist_mlp = view(base.hist_mlp, {NUM_VISITS, m, H});
+  b.hist_k = view(base.hist_k, {NUM_VISITS, m, KV_DIM});
+  b.hist_v = view(base.hist_v, {NUM_VISITS, m, KV_DIM});
+  return b;
+}
+
 std::vector<const float*> Buffers::blocks(int l, int p) const {
   auto f = [](const Tensor& t) { return static_cast<const float*>(t.data); };
   if (l < 1) return {};

@@ -15,6 +15,7 @@
 #include "kernels/prefill/prefill.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -43,13 +44,15 @@ std::vector<const float*> blocks_of(int l, int p, const float* B0, const float* 
 
 struct Prefiller::ExpertTransfer {
   cudaStream_t stream = nullptr;
-  cudaEvent_t ready = nullptr;
-  cudaEvent_t consumed = nullptr;
+  cudaEvent_t ready[2] = {nullptr, nullptr};
+  cudaEvent_t consumed[2] = {nullptr, nullptr};
 
   ~ExpertTransfer() {
     if (stream) cudaStreamSynchronize(stream);
-    if (ready) cudaEventDestroy(ready);
-    if (consumed) cudaEventDestroy(consumed);
+    for (int i = 0; i < 2; ++i) {
+      if (ready[i]) cudaEventDestroy(ready[i]);
+      if (consumed[i]) cudaEventDestroy(consumed[i]);
+    }
     if (stream) cudaStreamDestroy(stream);
   }
 };
@@ -75,48 +78,88 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   auto bf16 = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
   auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * 4)); };
   B0_ = f32(C * H), B1_ = f32(C * H);
-  for (int p = 0; p < PASSES; ++p) B2_[p] = f32(C * H), E_[p] = f32(C * H);
-  hid_ = f32(C * H), part_ = f32(C * H), y_ = f32(C * H), y2_ = f32(C * H);
+  // B2_[2] aliases B2_[0] and E_[2] aliases E_[0] (pass 0's blocks are never read after pass 1);
+  // y2_ aliases y_ (attention write and MLP write have disjoint lifetimes).
+  B2_[0] = f32(C * H), B2_[1] = f32(C * H), B2_[2] = B2_[0];
+  E_[0] = f32(C * H), E_[1] = f32(C * H), E_[2] = E_[0];
+  hid_ = f32(C * H), part_ = f32(C * H), y_ = f32(C * H), y2_ = y_;
   xin_ = bf16(3 * C * H), xm_ = bf16(C * H), xf_ = bf16(C * H);
-  mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H), mixm_ = f32(C * H);
-  // All three phases are ordered on stream_: the gates finish before projection/attention,
-  // and attention finishes before the routed-expert products. Only the weight staging stream
-  // runs independently, and it uses stage_ exclusively.
+  msgs_ = f32(4 * C * H);
+  // Non-overlapping per-visit phases aliased into one slab (all stream-ordered on stream_):
+  //   1. Attention mix + gates: mixf_ | gin_ | fpre_ | gpre_
+  //   2. Projection + attention + wo: rel_ | proj_ | q_ | rel16_ | attn_out_ (wo_out_ aliases rel_)
+  //   3. MLP mix + gates + MoE: mixm_ | act_ | down_ | moe_sum_
   const std::size_t rel_elements = C * HEADS * REL_EXTENT;
   const std::size_t projection_elements = C * PROJ_ROWS_FULL;
+  const std::size_t q_elements = C * HEADS * HEAD_DIM;
+  const std::size_t rel16_elements = C * HEADS * D_REL;
+  const std::size_t attn_out_elements = C * HEADS * HEAD_DIM;
+  const std::size_t phase2_elements =
+      rel_elements + projection_elements + q_elements + rel16_elements + attn_out_elements;
+
+  const std::size_t mixf_elements = C * 3 * 2 * H;  // 3*C*H floats = 6*C*H bf16
   const std::size_t gate_inputs = C * 3 * 2 * H;
-  const std::size_t gate_outputs = C * 4 * H;  // two FP32 rows per token, counted in BF16 elements
+  const std::size_t gate_outputs = C * 4 * H;       // two FP32 rows per token, counted in BF16 elements
+  const std::size_t phase1_elements = mixf_elements + gate_inputs + gate_outputs;
+
   const std::size_t expert_activations = C * TOP_K * INTER;
   const std::size_t expert_outputs = C * TOP_K * H;
-  static_assert(H % 2 == 0);  // gate_inputs is also aligned for FP32 scratch
-  auto* phase = bf16(std::max({rel_elements + projection_elements, gate_inputs + gate_outputs,
-                              expert_activations + expert_outputs}));
-  rel_ = phase;
-  proj_ = phase + rel_elements;
-  gin_ = phase;
-  fpre_ = reinterpret_cast<float*>(phase + gate_inputs);
+  const std::size_t moe_sum_elements = C * H;
+  const std::size_t phase3_elements = expert_activations + expert_outputs + moe_sum_elements;
+  static_assert(H % 2 == 0);
+  auto* phase = bf16(std::max({phase1_elements, phase2_elements, phase3_elements}));
+
+  mixf_ = reinterpret_cast<float*>(phase);
+  gin_ = phase + mixf_elements;
+  fpre_ = reinterpret_cast<float*>(gin_ + gate_inputs);
   gpre_ = fpre_ + C * H;
+  mixm_ = reinterpret_cast<float*>(phase);  // MLP mix/gates run before MoE
+
+  rel_ = phase;
+  proj_ = rel_ + rel_elements;
+  q_ = proj_ + projection_elements;
+  rel16_ = q_ + q_elements;
+  attn_out_ = rel16_ + rel16_elements;
+  wo_out_ = rel_;  // rel_ is dead once attention finishes
+
   act_ = phase;
-  down_ = phase + expert_activations;
-  q_ = bf16(C * HEADS * HEAD_DIM), rel16_ = bf16(C * HEADS * D_REL);
+  down_ = act_ + expert_activations;
+  moe_sum_ = down_ + expert_outputs;
+
   krows_ = bf16(std::size_t(kpos_rows_) * KV_DIM), vrows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
   kpos_ = i32(kpos_rows_);
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
-  attn_out_ = bf16(C * HEADS * HEAD_DIM), wo_out_ = bf16(C * H);
   g16_ = bf16(C * GATE_RANK);
   router_logits_ = f32(C * EXPERTS), wts_ = f32(C * TOP_K);
   idx_ = i32(C * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(C * TOP_K), pair_dst_ = i32(C * TOP_K);
   tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
-  moe_sum_ = bf16(C * H);
-  wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
+  const bool fp8_dense_env = [] {
+    const char* e = std::getenv("INGINE_PREFILL_FP8_DENSE");
+    return !e || std::atoi(e) != 0;
+  }();
+  fp8_dense_ = w.dense_fp8 && fp8_dense_env;
+  wscratch_ = (w.dense_fp8 && !fp8_dense_)
+                  ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM))
+                  : nullptr;
+  const std::size_t dense_q_bytes =
+      std::max(std::size_t(3) * C * H, C * HEADS * HEAD_DIM) +
+      ((std::max(std::size_t(3) * C * H, C * HEADS * HEAD_DIM) / 32 + 255) / 256) * 256 + 256;
+  const std::size_t moe_up_q_bytes = C * (H / 2) + ((C * (H / 16) + 255) / 256) * 256 + C * 4 + 512;
+  const std::size_t moe_dn_q_bytes =
+      C * TOP_K * (INTER / 2) + ((C * TOP_K * (INTER / 16) + 255) / 256) * 256 + C * TOP_K * 4 + 512;
+  qbuf_bytes_ = std::max({dense_q_bytes, moe_up_q_bytes, moe_dn_q_bytes});
+  qbuf_ = static_cast<uint8_t*>(alloc(qbuf_bytes_));
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
   if (stage_.p && overlap) {
+    stage_slots_ = stage_.bytes >= (128u << 20) ? 2 : 1;
     transfer_ = std::make_unique<ExpertTransfer>();
     CUDA_CHECK(cudaStreamCreateWithFlags(&transfer_->stream, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaEventCreateWithFlags(&transfer_->ready, cudaEventDisableTiming));
-    CUDA_CHECK(cudaEventCreateWithFlags(&transfer_->consumed, cudaEventDisableTiming));
+    for (int i = 0; i < 2; ++i) {
+      CUDA_CHECK(cudaEventCreateWithFlags(&transfer_->ready[i], cudaEventDisableTiming));
+      CUDA_CHECK(cudaEventCreateWithFlags(&transfer_->consumed[i], cudaEventDisableTiming));
+    }
   }
 }
 
@@ -195,17 +238,18 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     }
   };
 
-  auto stage_experts = [&](const Layer& layer, pk::MoeExperts& me, cudaStream_t copy_stream) {
+  auto stage_experts = [&](const Layer& layer, pk::MoeExperts& me, cudaStream_t copy_stream, int slot) {
     const int hot = w.experts_hot[layer.idx], keep = w.experts_keep[layer.idx];
     if (!stage_.p || keep <= hot) return;
     const Experts& experts = layer.experts;
     const std::size_t b13 = experts.w13.bytes() / EXPERTS, b13s = experts.w13_scale.bytes() / EXPERTS;
     const std::size_t b2 = experts.w2.bytes() / EXPERTS, b2s = experts.w2_scale.bytes() / EXPERTS;
     const std::size_t bytes_per_expert = b13 + b13s + b2 + b2s;
-    const int n = std::min<int>(keep - hot, int(stage_.bytes / bytes_per_expert));
+    const std::size_t slot_bytes = stage_.bytes / std::size_t(stage_slots_);
+    const int n = std::min<int>(keep - hot, int(slot_bytes / bytes_per_expert));
     if (n == 0) return;
 
-    char* dst = static_cast<char*>(stage_.p);
+    char* dst = static_cast<char*>(stage_.p) + std::size_t(slot) * slot_bytes;
     auto copy = [&](const Tensor& tensor, std::size_t bytes) {
       char* start = dst;
       CUDA_CHECK(cudaMemcpyAsync(start, static_cast<const char*>(tensor.data) + std::size_t(hot) * bytes,
@@ -221,6 +265,17 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     me.stage_n = n;
   };
 
+  auto align256 = [](std::size_t n) { return (n + 255) / 256 * 256; };
+  auto make_moe_q = [&](int rows, int K) {
+    pk::MoeQuantScratch qs;
+    const std::size_t v_bytes = align256(std::size_t(rows) * (K / 2));
+    const std::size_t s_bytes = align256(std::size_t(rows) * (K / 16));
+    qs.xq = qbuf_;
+    qs.xscale = qbuf_ + v_bytes;
+    qs.xouter = reinterpret_cast<float*>(qbuf_ + v_bytes + s_bytes);
+    return qs;
+  };
+
   pk::widen_ids(tokens, T, ids_, IMAGE_PLACEHOLDER_ID, s);
   dense::embed(ids_, T, bf16p(w.embed), f32p(w.embed_norm), B0_, false, s);
   // image tokens: the vision tower's rows take the place of the placeholder's embedding (model.forward's
@@ -231,6 +286,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   }
   int prev_v = -1;
   int tap = 0;
+  int stage_seq = 0;
 
   for (int v = 0; v < NUM_VISITS; ++v) {
     const int l = VISITS[v].layer, p = VISITS[v].pass;
@@ -238,11 +294,11 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     const Experts& ex = layer.experts;
     pk::MoeExperts me{ex.fmt == ExpertFormat::NVFP4 ? 0 : 1, ex.w13.data, ex.w13_scale.data,
                       f32p(ex.w13_factor), ex.w2.data, ex.w2_scale.data, f32p(ex.w2_factor)};
+    const int slot = stage_seq % stage_slots_;
     if (transfer_ && w.experts_keep[l] > w.experts_hot[l]) {
-      // Reuse the same VRAM slab. The copy waits for the previous visit's grouped GEMMs to release it.
-      CUDA_CHECK(cudaStreamWaitEvent(transfer_->stream, transfer_->consumed, 0));
-      stage_experts(layer, me, transfer_->stream);
-      if (me.stage_n) CUDA_CHECK(cudaEventRecord(transfer_->ready, transfer_->stream));
+      CUDA_CHECK(cudaStreamWaitEvent(transfer_->stream, transfer_->consumed[slot], 0));
+      stage_experts(layer, me, transfer_->stream, slot);
+      if (me.stage_n) CUDA_CHECK(cudaEventRecord(transfer_->ready[slot], transfer_->stream));
     }
     const bool msgs = is_loop_layer(l) && p > 0;
     const bool boundary = l % BLOCK == 0;
@@ -292,23 +348,55 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
 
     // ---- projections (fast.proj_layout): one GEMM for a single input, else per input segment
     const int R = proj_rows(layer.full);
-    const __nv_bfloat16* wp = bf16_rows(layer.wproj);
     const bool single = !layer.full && !msgs;
-    if (single) {
-      gemm_->run(xin_, H, wp, H, proj_, R, false, T, R, H, s);
+    if (fp8_dense_ && layer.wproj.fp8()) {
+      const int qrows = single ? T : 3 * T;
+      uint8_t* xq = qbuf_;
+      uint8_t* xs = qbuf_ + align256(std::size_t(qrows) * H);
+      pk::quantize_mxfp8(xin_, qrows, H, xq, xs, s);
+      const auto* wp8 = static_cast<const uint8_t*>(layer.wproj.w.data);
+      const float* ws = f32p(layer.wproj.scale);
+      if (single) {
+        pk::Fp8GemmProduct prod{wp8, ws, xq, xs, proj_, R, R};
+        pk::gemm_fp8_batch(&prod, 1, T, H, s);
+      } else {
+        struct Part {
+          int begin, end, input;
+        };
+        const Part parts[] = {{SEG_BEGIN[SEG_Q], SEG_BEGIN[SEG_K], 0},
+                              {SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], 1},
+                              {SEG_BEGIN[SEG_V], SEG_BEGIN[SEG_K_DYN], 2},
+                              {SEG_BEGIN[SEG_K_DYN], SEG_BEGIN[SEG_V_DYN], 1},
+                              {SEG_BEGIN[SEG_V_DYN], SEG_BEGIN[NUM_SEGS], 2}};
+        pk::Fp8GemmProduct prods[5];
+        int np = 0;
+        for (const Part& part : parts) {
+          if (part.begin >= R) break;
+          prods[np++] = pk::Fp8GemmProduct{
+              wp8 + std::size_t(part.begin) * H, ws + part.begin,
+              xq + std::size_t(part.input) * slab, xs + std::size_t(part.input) * (slab / 32),
+              proj_ + part.begin, part.end - part.begin, R};
+        }
+        pk::gemm_fp8_batch(prods, np, T, H, s);
+      }
     } else {
-      struct Part {
-        int begin, end, input;
-      };
-      const Part parts[] = {{SEG_BEGIN[SEG_Q], SEG_BEGIN[SEG_K], 0},
-                            {SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], 1},
-                            {SEG_BEGIN[SEG_V], SEG_BEGIN[SEG_K_DYN], 2},
-                            {SEG_BEGIN[SEG_K_DYN], SEG_BEGIN[SEG_V_DYN], 1},
-                            {SEG_BEGIN[SEG_V_DYN], SEG_BEGIN[NUM_SEGS], 2}};
-      for (const Part& part : parts) {
-        if (part.begin >= R) break;
-        gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H, proj_ + part.begin,
-                   R, false, T, part.end - part.begin, H, s);
+      const __nv_bfloat16* wp = bf16_rows(layer.wproj);
+      if (single) {
+        gemm_->run(xin_, H, wp, H, proj_, R, false, T, R, H, s);
+      } else {
+        struct Part {
+          int begin, end, input;
+        };
+        const Part parts[] = {{SEG_BEGIN[SEG_Q], SEG_BEGIN[SEG_K], 0},
+                              {SEG_BEGIN[SEG_K], SEG_BEGIN[SEG_V], 1},
+                              {SEG_BEGIN[SEG_V], SEG_BEGIN[SEG_K_DYN], 2},
+                              {SEG_BEGIN[SEG_K_DYN], SEG_BEGIN[SEG_V_DYN], 1},
+                              {SEG_BEGIN[SEG_V_DYN], SEG_BEGIN[NUM_SEGS], 2}};
+        for (const Part& part : parts) {
+          if (part.begin >= R) break;
+          gemm_->run(xin_ + std::size_t(part.input) * slab, H, wp + std::size_t(part.begin) * H, H, proj_ + part.begin,
+                     R, false, T, part.end - part.begin, H, s);
+        }
       }
     }
 
@@ -359,8 +447,17 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::attention(at, s);
 
     // ---- output projection + post-attention conv
-    const __nv_bfloat16* wo = bf16_rows(layer.wo);
-    gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_out_, H, false, T, H, HEADS * HEAD_DIM, s);
+    if (fp8_dense_ && layer.wo.fp8()) {
+      constexpr int K_WO = HEADS * HEAD_DIM;
+      uint8_t* xq = qbuf_;
+      uint8_t* xs = qbuf_ + align256(std::size_t(T) * K_WO);
+      pk::quantize_mxfp8(attn_out_, T, K_WO, xq, xs, s);
+      pk::Fp8GemmProduct prod{layer.wo.w.data, f32p(layer.wo.scale), xq, xs, wo_out_, H, H};
+      pk::gemm_fp8_batch(&prod, 1, T, K_WO, s);
+    } else {
+      const __nv_bfloat16* wo = bf16_rows(layer.wo);
+      gemm_->run(attn_out_, HEADS * HEAD_DIM, wo, HEADS * HEAD_DIM, wo_out_, H, false, T, H, HEADS * HEAD_DIM, s);
+    }
     pk::static_conv(wo_out_, H, T, H, f32p(layer.attn_conv), st.conv_attn_at(v), y_, s);
     pk::conv_state_update(st.conv_attn_at(v), wo_out_, H, T, H, s);
 
@@ -386,11 +483,16 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};
     pk::moe_route(idx_, T, work, s);
-    if (!transfer_) stage_experts(layer, me, s);
-    else if (me.stage_n) CUDA_CHECK(cudaStreamWaitEvent(s, transfer_->ready, 0));
-    pk::moe_gate_up(me, xm_, T, work, act_, s);
-    pk::moe_down(me, act_, T, work, down_, s);
-    if (transfer_ && me.stage_n) CUDA_CHECK(cudaEventRecord(transfer_->consumed, s));
+    if (!transfer_) stage_experts(layer, me, s, 0);
+    else if (me.stage_n) CUDA_CHECK(cudaStreamWaitEvent(s, transfer_->ready[slot], 0));
+    const pk::MoeQuantScratch q_up = make_moe_q(T, H);
+    pk::moe_gate_up(me, xm_, T, work, act_, s, &q_up);
+    const pk::MoeQuantScratch q_dn = make_moe_q(T * TOP_K, INTER);
+    pk::moe_down(me, act_, T, work, down_, s, &q_dn);
+    if (transfer_ && me.stage_n) {
+      CUDA_CHECK(cudaEventRecord(transfer_->consumed[slot], s));
+      ++stage_seq;
+    }
     if (stats_) pk::moe_stats(idx_, wts_, down_, T, stats_ + std::size_t(v) * EXPERTS * 3, s);
     pk::moe_combine(down_, wts_, T, moe_sum_, s);
     pk::static_conv(moe_sum_, H, T, H, f32p(layer.mlp_conv), st.conv_mlp_at(v), y2_, s);
@@ -404,7 +506,13 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
-  pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+  if (w.unembed_q4_codes.data) {
+    dense::head_q4_certified(xf_ + std::size_t(T - 1) * H, 1,
+                             dense::Q4Matrix{w.unembed_q4_codes.data, w.unembed_q4_scales.data, UNPADDED_VOCAB},
+                             dense::Matrix{w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB}, logits, s);
+  } else {
+    pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+  }
   CUDA_CHECK(cudaGetLastError());
   st.length = pos0 + T;
 }

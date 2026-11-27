@@ -1,5 +1,6 @@
 add_library(ingine_kernels_dense STATIC
   gemv.cu
+  head_q4.cu
   mix.cu
   gates.cu
   router.cu

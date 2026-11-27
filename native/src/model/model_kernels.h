@@ -72,10 +72,10 @@ void verify_rollback(const StatePtrs& st, const VerifyBackup& bk, const float* c
                      const std::int64_t* pos_dev, int pos_host, const std::int32_t* accepted_dev, int commit_host,
                      int m, cudaStream_t stream);
 
-// Up to 3 verify widths, ascending (Runtime::verify_widths()).
+// Up to 8 verify widths, ascending (Runtime::verify_widths()).
 struct Widths {
   int n = 0;
-  int w[3] = {};
+  int w[8] = {};
 };
 
 // Verify width selection on the device (engine._generate_spec): lead = leading conf[i] > threshold (i < 7),

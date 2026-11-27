@@ -17,40 +17,39 @@ constexpr int FOLD_THREADS = RANK;
 static_assert(H % FOLD_K == 0);
 
 // weights.dequant: BF16 rows as is, FP8 rows -> bf16(float(q) * scale)
-__device__ __forceinline__ double u_at(const void* u, const float* scale, int row, int k) {
-  if (scale == nullptr) return double(bf(static_cast<const __nv_bfloat16*>(u)[size_t(row) * H + k]));
+__device__ __forceinline__ float u_at(const void* u, const float* scale, int row, int k) {
+  if (scale == nullptr) return bf(static_cast<const __nv_bfloat16*>(u)[size_t(row) * H + k]);
   const __nv_fp8_storage_t q = static_cast<const __nv_fp8_storage_t*>(u)[size_t(row) * H + k];
   const __half_raw hr = __nv_cvt_fp8_to_halfraw(q, __NV_E4M3);
   const float f = __half2float(__half(hr));
-  return double(bf_round(__fmul_rn(f, scale[row])));
+  return bf_round(__fmul_rn(f, scale[row]));
 }
 
-// torch double -> bfloat16: through float (round to nearest), then to BF16 (round to nearest even)
-__device__ __forceinline__ __nv_bfloat16 to_bf16(double x) { return __float2bfloat16_rn(__double2float_rn(x)); }
+__device__ __forceinline__ __nv_bfloat16 to_bf16(float x) { return __float2bfloat16_rn(x); }
 
 __global__ void __launch_bounds__(FOLD_THREADS) fold_w_kernel(const void* __restrict__ u,
                                                               const float* __restrict__ scale, int rows,
                                                               const __nv_bfloat16* __restrict__ hw,
                                                               __nv_bfloat16* __restrict__ fold_w) {
-  __shared__ double us[FOLD_ROWS][FOLD_K];
-  __shared__ double hs[FOLD_K][RANK];
+  __shared__ float us[FOLD_ROWS][FOLD_K];
+  __shared__ float hs[FOLD_K][RANK];
   const int r0 = blockIdx.x * FOLD_ROWS, t = threadIdx.x;
-  double acc[FOLD_ROWS];
+  float acc[FOLD_ROWS];
 #pragma unroll
-  for (int r = 0; r < FOLD_ROWS; ++r) acc[r] = 0.0;
+  for (int r = 0; r < FOLD_ROWS; ++r) acc[r] = 0.f;
   for (int k0 = 0; k0 < H; k0 += FOLD_K) {
     for (int idx = t; idx < FOLD_ROWS * FOLD_K; idx += FOLD_THREADS) {
       const int r = idx / FOLD_K, k = idx % FOLD_K;
-      us[r][k] = r0 + r < rows ? u_at(u, scale, r0 + r, k0 + k) : 0.0;
+      us[r][k] = r0 + r < rows ? u_at(u, scale, r0 + r, k0 + k) : 0.f;
     }
 #pragma unroll
-    for (int k = 0; k < FOLD_K; ++k) hs[k][t] = double(bf(hw[size_t(k0 + k) * RANK + t]));
+    for (int k = 0; k < FOLD_K; ++k) hs[k][t] = bf(hw[size_t(k0 + k) * RANK + t]);
     __syncthreads();
 #pragma unroll
     for (int k = 0; k < FOLD_K; ++k) {
-      const double h = hs[k][t];
+      const float h = hs[k][t];
 #pragma unroll
-      for (int r = 0; r < FOLD_ROWS; ++r) acc[r] = fma(us[r][k], h, acc[r]);
+      for (int r = 0; r < FOLD_ROWS; ++r) acc[r] = fmaf(us[r][k], h, acc[r]);
     }
     __syncthreads();
   }
@@ -65,8 +64,8 @@ __global__ void __launch_bounds__(256) fold_b_kernel(const void* __restrict__ u,
                                                      __nv_bfloat16* __restrict__ fold_b) {
   const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
   if (row >= rows) return;
-  double acc = 0.0;
-  for (int k = lane; k < H; k += 32) acc = fma(u_at(u, scale, row, k), double(bf(hb[k])), acc);
+  float acc = 0.f;
+  for (int k = lane; k < H; k += 32) acc = fmaf(u_at(u, scale, row, k), bf(hb[k]), acc);
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
   if (lane == 0) fold_b[row] = to_bf16(acc);

@@ -250,7 +250,13 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
   fp.out_copy = taps + std::size_t(tap) * H;
   fp.out_copy_stride = std::int64_t(NUM_TAPS) * H;
   dense::mix(fp, pdl, stream);
-  dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
+  if (w.unembed_q4_codes.data) {
+    dense::head_q4_certified(bf16m(b.xf), m,
+                             dense::Q4Matrix{w.unembed_q4_codes.data, w.unembed_q4_scales.data, UNPADDED_VOCAB},
+                             matrix(w.unembed), f32m(b.logits), stream);
+  } else {
+    dense::head(bf16m(b.xf), m, matrix(w.unembed), f32m(b.logits), pdl, stream);
+  }
 }
 
 }  // namespace ingine::model

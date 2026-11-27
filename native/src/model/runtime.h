@@ -51,6 +51,7 @@ Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, 
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
 State make_state(int max_ctx, bool kv_fp8, bool kv_v4 = false, bool elastic_kv = false, bool kv_k4 = false);
 Buffers make_buffers(int m);
+Buffers alias_buffers(const Buffers& base, int m);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
 void reset_state(State& state, cudaStream_t stream);
@@ -204,6 +205,7 @@ class Runtime {
   State state_;
   std::unique_ptr<Decoder> decoder_;
   DeviceBuffer pos_, token_;
+  Buffers buffers_base_;
   std::map<int, Buffers> buffers_;
   std::map<int, bool> history_;
   std::map<int, cudaGraphExec_t> graphs_;

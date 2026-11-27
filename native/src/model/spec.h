@@ -59,6 +59,7 @@ class SpecLoop {
   Drafter& drafter_;
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device
+  DeviceBuffer coupled_seed_;          // uint64: shared exponential-race seed for coupled speculative sampling
   MappedHostBuffer record_;            // VerifyRecord of the last round
   MappedHostBuffer forced_window_;     // forced replay: int32 [8], the forced tokens after the round's anchor
   MappedHostBuffer suffix_input_;             // optional greedy lookup tokens and confidence

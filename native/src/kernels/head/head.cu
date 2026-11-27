@@ -13,6 +13,7 @@
 #include "kernels/head/head.h"
 
 #include "core/device.h"
+#include "kernels/common/race.cuh"
 
 #include <cuda_runtime.h>
 
@@ -426,6 +427,42 @@ __global__ void __launch_bounds__(kFast) select_kernel(const float* __restrict__
       if (!(p > 0.f)) continue;
       s = __fadd_rn(logf(p), gumbel(seed, counter, static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(v)));
     }
+    if (better(s, v, bv, bi)) bv = s, bi = v;
+  }
+  fast_argmax(bv, bi, red);
+  if (threadIdx.x == 0) part->v[r][b] = bv, part->i[r][b] = bi;
+  if (!finish_part(&part->done[r], red)) return;
+  bv = -CUDART_INF_F;
+  bi = INT_MAX;
+  if (threadIdx.x < kParts) {
+    bv = const_cast<volatile float&>(part->v[r][threadIdx.x]);
+    bi = const_cast<volatile int&>(part->i[r][threadIdx.x]);
+  }
+  fast_argmax(bv, bi, red);
+  if (threadIdx.x == 0) {
+    out[r] = bi == INT_MAX ? 0 : bi;
+    part->done[r] = 0;
+  }
+}
+
+__global__ void __launch_bounds__(kFast)
+    select_coupled_kernel(const float* __restrict__ in, int V, long long stride, float inv_t,
+                          const std::uint64_t* __restrict__ seed_dev, const std::int64_t* __restrict__ pos_dev,
+                          SelectPartials* __restrict__ part, std::int32_t* __restrict__ out,
+                          const std::uint32_t* __restrict__ thr) {
+  __shared__ FastReduce red;
+  const int r = blockIdx.y, b = blockIdx.x;
+  const float* row = in + r * stride;
+  const unsigned long long key =
+      kernels::race::draw_key(*seed_dev, static_cast<unsigned>(*pos_dev + 1 + r));
+  const int chunk = (V + kParts - 1) / kParts;
+  const int v1 = min(V, (b + 1) * chunk);
+  float bv = -CUDART_INF_F;
+  int bi = INT_MAX;
+  for (int v = b * chunk + threadIdx.x; v < v1; v += kFast) {
+    const float z = __fmul_rn(row[v], inv_t);
+    if (thr && fkey(z) < thr[r]) continue;
+    const float s = __fadd_rn(z, kernels::race::boost(key, v));
     if (better(s, v, bv, bi)) bv = s, bi = v;
   }
   fast_argmax(bv, bi, red);
@@ -862,6 +899,31 @@ void sample(const float* logits, int rows, int V, std::int64_t stride, const Sam
   }
   dist_kernel<0><<<rows, kBlock, 0, stream>>>(logits, V, stride, inv_t, params.top_k, params.top_p, rng.seed,
                                               rng.counter++, out, nullptr);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void sample_coupled(const float* logits, int rows, int V, std::int64_t stride, const SamplingParams& params,
+                    const std::uint64_t* seed_dev, const std::int64_t* pos_dev, std::int32_t* out,
+                    cudaStream_t stream) {
+  check_rows(logits, rows, V, stride);
+  if (rows == 0) return;
+  if (params.temperature <= 0.f) {
+    argmax(logits, rows, V, stride, out, stream);
+    return;
+  }
+  require(rows <= kFastRows && seed_dev != nullptr && pos_dev != nullptr, "sample_coupled: bad arguments");
+  const float inv_t = 1.0f / params.temperature;
+  static SelectPartials* const part = symbol(g_select[0]);
+  if (plain_sampling(params, V)) {
+    select_coupled_kernel<<<dim3(kParts, rows), kFast, 0, stream>>>(logits, V, stride, inv_t, seed_dev, pos_dev,
+                                                                    part + 1, out, nullptr);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
+  const TruncState* st = launch_truncation(logits, rows, V, stride, inv_t, params, 0, stream);
+  const auto* thr = reinterpret_cast<const std::uint32_t*>(reinterpret_cast<const char*>(st) + offsetof(TruncState, thr));
+  select_coupled_kernel<<<dim3(kParts, rows), kFast, 0, stream>>>(logits, V, stride, inv_t, seed_dev, pos_dev,
+                                                                  part + 1, out, thr);
   CUDA_CHECK(cudaGetLastError());
 }
 

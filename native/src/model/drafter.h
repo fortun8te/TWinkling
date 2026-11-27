@@ -46,7 +46,7 @@ class Drafter {
   static constexpr int GAMMA = kernels::draft::GAMMA;  // 7 drafts per round
   static constexpr int DRAFT_CTX = 16384;              // global-layer ring slots (at most; saves 96 MiB VRAM + 4x faster draft attn)
   static constexpr int SHORTLIST_ROWS = 32768;         // ranked tokens in the shortlist head
-  static constexpr int CONTEXT_ROWS = 16384;           // context tokens added to it (until reset())
+  static constexpr int CONTEXT_ROWS = 8192;            // context tokens added to it (until reset())
 
   // Loads mtp.safetensors from model_dir; `w` supplies the embedding, its norm and the unembedding (the
   // base logits use w.unembed as stored: FP8 rows with dense_fp8). `w` must outlive the drafter.
@@ -140,7 +140,6 @@ class Drafter {
     const __nv_bfloat16 *in_norm, *post_norm, *ctx_norm, *q_norm, *k_norm, *k_norm_ctx;
     kernels::dense::Matrix qkv, gate_up;  // FP8 rows + scales
     kernels::dense::Matrix wo, w_down;    // FP8 rows + scales: [H, 3072], [H, inter]
-    const __nv_bfloat16* wkv_ctx;         // BF16 [2048, H]: k_proj_ctx | v_proj_ctx (large commits)
     void *k_ctx, *v_ctx;                  // [slots, 8, 128]: BF16 (local rings), BF16 or E4M3 (the global ring)
     std::int32_t* ctx_pos;                // local layers: int32 [WINDOW]; null for the global layer
   };
@@ -169,7 +168,6 @@ class Drafter {
   void global_written(int begin, int end);  // positions [begin, end) written into the global ring
   std::vector<DeviceBuffer> storage_;
   std::vector<MappedHostBuffer> host_storage_;
-  kernels::draft::Bf16Gemm gemm_;
 
   std::array<DraftLayer, 3> layers_{};
   const __nv_bfloat16* alpha_ = nullptr;  // bf16 [4, 4] softmax(fuse_weight)
@@ -201,8 +199,9 @@ class Drafter {
   float *draft_logits_ = nullptr, *conf_ = nullptr, *qstats_ = nullptr;
   std::int32_t* tokens_ = nullptr;
   int *seg_qkv_ = nullptr, *seg_gate_up_ = nullptr, *seg_short_ = nullptr, *seg_kv_ = nullptr;
-  // commit scratch: large commits (cuBLASLt) and the small commit (dense proj over the three layers)
+  // commit scratch: large commits (SM120a FP8 GEMM over wkv_all_) and small commit (dense proj)
   __nv_bfloat16 *warm_feats_ = nullptr, *ctx_c_ = nullptr, *ctx_kv_ = nullptr, *commit_xin_ = nullptr;
+  uint8_t *ctx_xq_ = nullptr, *ctx_xs_ = nullptr;
   float* commit_kv_ = nullptr;
 
   AcceptScratch accept_{};

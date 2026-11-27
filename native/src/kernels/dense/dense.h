@@ -21,6 +21,17 @@ struct Matrix {
   int rows = 0;
 };
 
+// Group-32 symmetric INT4 proxy matrix [rows, 2304] in VRAM for Certified Lazy LM Head.
+struct Q4Matrix {
+  const void* codes = nullptr;   // uint8 [rows, 1152]
+  const void* scales = nullptr;  // half  [rows, 72]
+  int rows = 0;
+};
+void quantize_q4_and_fp8_rows(const __nv_bfloat16* src, int rows, void* q4_codes, void* q4_scales,
+                              void* fp8_codes, float* fp8_scales, cudaStream_t stream);
+void head_q4_certified(const __nv_bfloat16* x, int M, Q4Matrix q4, Matrix exact_host, float* out,
+                       cudaStream_t stream);
+
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,
 // input index); out fp32 [M, R] = bf16(w[r] . xin[seg(r).input, m]), R = w.rows.
 void proj(const __nv_bfloat16* xin, int M, Matrix w, const int* segments, int nseg, float* out, bool pdl,

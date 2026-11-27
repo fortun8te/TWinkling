@@ -480,21 +480,49 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     if (ref->dtype != "BF16") throw std::runtime_error("weights: unembed must be BF16");
     const std::size_t row_bytes = std::size_t(H) * 2;
     if (dense_fp8) {
-      // FP8 rows converted in pieces of 16384 rows (RTX 5080 port: no full BF16 copy on the device; fp8_rows is
-      // per row, so the result is the same)
-      void* q = ld.alloc(std::size_t(UNPADDED_VOCAB) * H);
-      float* sc = static_cast<float*>(ld.alloc(std::size_t(UNPADDED_VOCAB) * 4));
+      const bool lazy_head = [] {
+        const char* e = std::getenv("INGINE_LAZY_HEAD");
+        return e && std::atoi(e) != 0;
+      }();
       constexpr int kPiece = 16384;
       DeviceBuffer tmp(std::size_t(kPiece) * row_bytes);
-      for (int r0 = 0; r0 < UNPADDED_VOCAB; r0 += kPiece) {
-        const int n = std::min(kPiece, UNPADDED_VOCAB - r0);
-        const UploadRequest req{ref.file, ref->offset + std::uint64_t(r0) * row_bytes, std::uint64_t(n) * row_bytes, tmp.p};
-        head_reads += up.upload(std::span<const UploadRequest>(&req, 1), stream).read_calls;
-        kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(tmp.p), n, H,
-                                 static_cast<std::uint8_t*>(q) + std::size_t(r0) * H, sc + r0, stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));  // before tmp is reused
+      if (lazy_head) {
+        // Certified Lazy 4-Bit LM Head: Q4 proxy in VRAM (247 MiB) + exact FP8 rows in mapped host RAM (0 MiB VRAM).
+        void* q4c = ld.alloc(std::size_t(UNPADDED_VOCAB) * (H / 2));
+        void* q4s = ld.alloc(std::size_t(UNPADDED_VOCAB) * (H / 32) * 2);
+        w.host.emplace_back(std::size_t(UNPADDED_VOCAB) * H);
+        void* fp8_host = w.host.back().device_ptr();
+        float* sc = static_cast<float*>(ld.alloc(std::size_t(UNPADDED_VOCAB) * 4));
+        for (int r0 = 0; r0 < UNPADDED_VOCAB; r0 += kPiece) {
+          const int n = std::min(kPiece, UNPADDED_VOCAB - r0);
+          const UploadRequest req{ref.file, ref->offset + std::uint64_t(r0) * row_bytes, std::uint64_t(n) * row_bytes, tmp.p};
+          head_reads += up.upload(std::span<const UploadRequest>(&req, 1), stream).read_calls;
+          kernels::dense::quantize_q4_and_fp8_rows(
+              static_cast<const __nv_bfloat16*>(tmp.p), n,
+              static_cast<std::uint8_t*>(q4c) + std::size_t(r0) * (H / 2),
+              static_cast<std::uint8_t*>(q4s) + std::size_t(r0) * (H / 32) * 2,
+              static_cast<std::uint8_t*>(fp8_host) + std::size_t(r0) * H,
+              sc + r0, stream);
+          CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+        w.unembed = Dense{rm(fp8_host, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H}), rm(sc, DType::FP32, {UNPADDED_VOCAB})};
+        w.unembed_q4_codes = rm(q4c, DType::U8, {UNPADDED_VOCAB, H / 2});
+        w.unembed_q4_scales = rm(q4s, DType::U8, {UNPADDED_VOCAB, (H / 32) * 2});
+      } else {
+        // FP8 rows converted in pieces of 16384 rows (RTX 5080 port: no full BF16 copy on the device; fp8_rows is
+        // per row, so the result is the same)
+        void* q = ld.alloc(std::size_t(UNPADDED_VOCAB) * H);
+        float* sc = static_cast<float*>(ld.alloc(std::size_t(UNPADDED_VOCAB) * 4));
+        for (int r0 = 0; r0 < UNPADDED_VOCAB; r0 += kPiece) {
+          const int n = std::min(kPiece, UNPADDED_VOCAB - r0);
+          const UploadRequest req{ref.file, ref->offset + std::uint64_t(r0) * row_bytes, std::uint64_t(n) * row_bytes, tmp.p};
+          head_reads += up.upload(std::span<const UploadRequest>(&req, 1), stream).read_calls;
+          kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(tmp.p), n, H,
+                                   static_cast<std::uint8_t*>(q) + std::size_t(r0) * H, sc + r0, stream);
+          CUDA_CHECK(cudaStreamSynchronize(stream));  // before tmp is reused
+        }
+        w.unembed = Dense{rm(q, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H}), rm(sc, DType::FP32, {UNPADDED_VOCAB})};
       }
-      w.unembed = Dense{rm(q, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H}), rm(sc, DType::FP32, {UNPADDED_VOCAB})};
     } else {
       void* d = ld.alloc(std::size_t(UNPADDED_VOCAB) * row_bytes);
       ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]

@@ -34,7 +34,7 @@ struct SuffixInput {
 
 Widths verify_widths(const Runtime& rt) {
   const std::span<const int> w = rt.verify_widths();
-  if (w.empty() || w.size() > 3) throw std::invalid_argument("SpecLoop: the runtime has no verify widths (spec off)");
+  if (w.empty() || w.size() > 8) throw std::invalid_argument("SpecLoop: the runtime has no verify widths (spec off)");
   Widths r;
   r.n = int(w.size());
   std::copy(w.begin(), w.end(), r.w);
@@ -45,8 +45,8 @@ Widths verify_widths(const Runtime& rt) {
 }  // namespace
 
 SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
-    : rt_(rt), drafter_(drafter), width_(sizeof(std::int32_t)), record_(sizeof(VerifyRecord)),
-      forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
+    : rt_(rt), drafter_(drafter), width_(sizeof(std::int32_t)), coupled_seed_(sizeof(std::uint64_t)),
+      record_(sizeof(VerifyRecord)), forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
   if (drafter.stream() != rt.stream()) throw std::invalid_argument("SpecLoop: drafter and runtime streams differ");
   const Widths widths = verify_widths(rt);
   // the draft outputs live at fixed addresses: one draft names them (its scratch rows are reset)
@@ -153,7 +153,11 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
   auto* record_dev = static_cast<VerifyRecord*>(record_.device_ptr());
   const auto* record = static_cast<const VerifyRecord*>(record_.data());
   prepare_accept(sampling);
-  if (sampling.temperature > 0.f) drafter_.set_seed(splitmix64(rng.seed ^ splitmix64(rng.counter++)));
+  if (sampling.temperature > 0.f) {
+    const std::uint64_t seed = splitmix64(rng.seed ^ splitmix64(rng.counter++));
+    drafter_.set_seed(seed);
+    CUDA_CHECK(cudaMemcpyAsync(coupled_seed_.p, &seed, sizeof(seed), cudaMemcpyHostToDevice, stream));
+  }
 
   const bool lookup_enabled = rt_.options().suffix_draft && greedy && !forced;
   SuffixLookup lookup;

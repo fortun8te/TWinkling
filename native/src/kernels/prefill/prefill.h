@@ -36,6 +36,21 @@ class Gemm {
   Impl* impl_;
 };
 
+// Blackwell SM120a block-scaled FP8 dense GEMM (mxf8f6f4.block_scale.scale_vec::1X.m16n8k32).
+// quantize_mxfp8 quantizes BF16 [rows, k] -> E4M3 values [rows, k] + UE8M0 scales [rows, k/32].
+void quantize_mxfp8(const __nv_bfloat16* x, int rows, int k, uint8_t* values, uint8_t* scales, cudaStream_t stream);
+
+struct Fp8GemmProduct {
+  const void* w = nullptr;        // E4M3 [n, k]
+  const float* w_scale = nullptr; // FP32 [n]
+  const uint8_t* x = nullptr;     // E4M3 [m, k]
+  const uint8_t* x_scale = nullptr; // UE8M0 [m, k/32]
+  __nv_bfloat16* out = nullptr;   // BF16 [m, out_ld]
+  int n = 0;
+  int out_ld = 0;
+};
+void gemm_fp8_batch(const Fp8GemmProduct* products, int count, int m, int k, cudaStream_t stream);
+
 // ------------------------------------------------------------------------------------------- attention
 
 // Keys/values of one sliding visit for the chunk: rows [0, 1024) are the ring before the chunk, rotated so
@@ -162,13 +177,19 @@ struct MoeExperts {
   int stage_first = 0, stage_n = 0;
   const void *stage_w13 = nullptr, *stage_w13_scale = nullptr, *stage_w2 = nullptr, *stage_w2_scale = nullptr;
 };
+// Scratch for SM120a NVFP4 W4A4 activation quantization (Four-Over-Six).
+struct MoeQuantScratch {
+  uint8_t* xq = nullptr;     // [rows, K/2] E2M1 packed
+  uint8_t* xscale = nullptr; // [rows, K/16] E4M3 block scales
+  float* xouter = nullptr;   // [rows] FP32 outer scales
+};
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
-// exactly as model.decode_experts). x bf16 [T, H], act bf16 [T * 8, 1152] by sorted pair.
+// exactly as model.decode_experts, or native SM120a NVFP4 W4A4 when qscratch != nullptr).
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
-                 cudaStream_t stream);
+                 cudaStream_t stream, const MoeQuantScratch* qscratch = nullptr);
 // down[t * 8 + slot] = bf16(W2_e . act[pair]), bf16 [T * 8, H].
 void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWork& w, __nv_bfloat16* down,
-              cudaStream_t stream);
+              cudaStream_t stream, const MoeQuantScratch* qscratch = nullptr);
 // out[t] = bf16(sum over slots in order of down[t, slot] * wts[t, slot]), bf16 [T, H].
 void moe_combine(const __nv_bfloat16* down, const float* wts, int T, __nv_bfloat16* out, cudaStream_t stream);
 // RTX 5080 port (expert calibration): stats fp32 [128, 3] += per expert {pairs, sum of weights, sum of

@@ -405,7 +405,7 @@ void round_begin(DraftParams* p, const RoundInputs& in, const __nv_bfloat16* alp
                  const __nv_bfloat16* mask_embed, const __nv_bfloat16* in_norm, __nv_bfloat16* xin,
                  __nv_bfloat16* f_rnn, __nv_bfloat16* res, __nv_bfloat16* xn, unsigned long long* picks,
                  cudaStream_t stream) {
-  if (in.nwidths < 1 || in.nwidths > 3 || !in.m || !in.accepted || !in.next_greedy || !in.next_sampled)
+  if (in.nwidths < 1 || in.nwidths > 8 || !in.m || !in.accepted || !in.next_greedy || !in.next_sampled)
     throw std::invalid_argument("round_begin: incomplete round inputs");
   for (int i = 0; i < in.nwidths; ++i) require_aligned(in.taps[i], "round_begin: taps must be 16-byte aligned");
   require_aligned(embed, "round_begin: embed must be 16-byte aligned");

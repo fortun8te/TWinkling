@@ -57,8 +57,8 @@ void set_commit(DraftParams* p, const __nv_bfloat16* feats, int n, int start, cu
 // bf16 [m, 4, H]) are committed at start, and the next draft is at P = start + n from the anchor
 // *next_greedy (p->temperature <= 0) or *next_sampled. The temperature stays. See round_begin.
 struct RoundInputs {
-  const __nv_bfloat16* taps[3] = {};
-  int widths[3] = {};
+  const __nv_bfloat16* taps[8] = {};
+  int widths[8] = {};
   int nwidths = 0;
   const std::int32_t* m = nullptr;
   const std::int32_t* accepted = nullptr;
