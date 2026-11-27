@@ -4,6 +4,8 @@
 
 TWinkling is a fork of [ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine), the custom engine built for one RTX 5090. The 5090 keeps the whole model in 32 GB. The 5080 has half that, so TWinkling was rebuilt around the smaller card: experts split between VRAM and pinned host RAM, a prefill path that streams the rest over PCIe while it computes, 4-bit KV cache for long context, and Blackwell SM120 kernels tuned for the 5080's 84 SMs and 12-SM GPCs.
 
+![TWinkling: Inkling 2 Mini on one RTX 5080](benchmarks/rtx5080/long-context/cover.png)
+
 ![Start of tuning vs now on the RTX 5080: decode up to 2.4x, first token up to 3.7x faster, load 2.8x faster](benchmarks/rtx5080/long-context/summary.svg)
 
 | RTX 5080 · 250 W | Start | Now | Change |
