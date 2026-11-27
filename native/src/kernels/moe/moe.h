@@ -36,4 +36,29 @@ void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts,
 void dequant_experts(const void* codes, const void* scales, const float* factor, const std::int32_t* experts, int n,
                      int rows, int cols, Format fmt, __nv_bfloat16* out, cudaStream_t stream);
 
+
+// GGUF routed experts (GSQ-RCO packs; types: GGML ids 16-22 IQ2_XXS..IQ2_S, 42 Q2_0), see moe_gguf.cu.
+std::size_t gguf_row_bytes(int type, int K);  // 0: unsupported type
+std::size_t q8_1_bytes(int rows, int K);
+void quantize_q8_1(const __nv_bfloat16* x, int rows, int K, void* q8, cudaStream_t stream);
+// out bf16 [M, 8, I] as moe_up; xq8 = quantize_q8_1(x [M, 2304])
+void moe_up_gguf(const void* xq8, int M, const int* idx, int type, const void* w13, std::size_t row_bytes,
+                 __nv_bfloat16* out, cudaStream_t stream);
+// as moe_down; act_q8 = quantize_q8_1(act [M * 8, 1152])
+// y_scratch: down_scratch_bytes() of device memory (per-slot expert rows between the two stages)
+void moe_down_gguf(const void* act_q8, int M, const int* idx, const float* wts, int type, const void* w2,
+                   std::size_t row_bytes, float* y_scratch, const float* conv_w, float* conv_state, float* out,
+                   float* conv_hist, cudaStream_t stream);
+std::size_t down_scratch_bytes();
+
+// GGUF experts [E, rows, K] -> NVFP4 [E, rows, K/2] codes, E4M3 [E, rows, K/16] scales, fp32 [E] factors;
+// interleave_gate_up: NVFP4 row 2c = GGUF gate row c, 2c+1 = up row I + c (moe.cu's W13 order).
+// amax_scratch: 4 * E bytes of device memory.
+void gguf_to_nvfp4(int type, const void* w, std::size_t row_bytes, int rows, int K, int E, bool interleave_gate_up,
+                   void* amax_scratch, void* codes, void* scales, float* factor, cudaStream_t stream);
+
+// Test helper: float [n, K] = dequantized GGUF rows rows[i] (row index counted over the whole [E * R] tensor).
+void gguf_dequant_rows(int type, const void* w, std::size_t row_bytes, int K, const int* rows, int n, float* out,
+                       cudaStream_t stream);
+
 }  // namespace ingine::kernels::moe

@@ -1,6 +1,8 @@
 add_library(ingine_kernels_moe STATIC
   moe.cu
   dequant.cu
+  moe_gguf.cu
+  gguf_transcode.cu
 )
 ingine_cuda_target(ingine_kernels_moe)
 ingine_internal_includes(ingine_kernels_moe)

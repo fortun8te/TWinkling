@@ -8,6 +8,7 @@
 // The mixes and the embedding are ModelCore's decode kernels (per-row CTAs, any row count). Ablation of the
 // attention / MLP writes happens inside the mixes that consume them, as in the decode step.
 #include "model/prefill.h"
+#include "kernels/moe/moe.h"
 
 #include "core/device.h"
 #include "ingine/generator.h"
@@ -63,6 +64,11 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   bool tiered = false;
   for (int l = 0; l < LAYERS; ++l) tiered |= w.experts_keep[l] > w.experts_hot[l];
   if (stage_mib > 0 && tiered) stage_ = DeviceBuffer(std::size_t(stage_mib) << 20);
+  if (w.layers[0].experts.gguf()) {
+    const std::size_t E = EXPERTS, R13 = 2 * INTER, R2 = HIDDEN;
+    gguf_nv_ = DeviceBuffer(E * R13 * (HIDDEN / 2) + E * R13 * (HIDDEN / 16) + E * R2 * (INTER / 2) +
+                            E * R2 * (INTER / 16) + 3 * E * 4 + 1024);
+  }
   if (max_chunk < 1) throw std::invalid_argument("Prefiller: max_chunk must be positive");
   const int L = WINDOW + max_chunk;
   kpos_rows_ = (L + pk::kAttnKeyTile - 1) / pk::kAttnKeyTile * pk::kAttnKeyTile;
@@ -485,6 +491,21 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::moe_route(idx_, T, work, s);
     if (!transfer_) stage_experts(layer, me, s, 0);
     else if (me.stage_n) CUDA_CHECK(cudaStreamWaitEvent(s, transfer_->ready[slot], 0));
+    if (ex.gguf()) {
+      // transcode this layer's GGUF experts into the NVFP4 scratch the grouped GEMMs read
+      const std::size_t E = EXPERTS, R13 = 2 * INTER, R2 = H;
+      char* base = static_cast<char*>(gguf_nv_.p);
+      char* c13 = base;
+      char* s13 = c13 + E * R13 * (H / 2);
+      char* c2 = s13 + E * R13 * (H / 16);
+      char* s2 = c2 + E * R2 * (INTER / 2);
+      float* f13 = reinterpret_cast<float*>((reinterpret_cast<std::uintptr_t>(s2 + E * R2 * (INTER / 16)) + 255) & ~std::uintptr_t(255));
+      float* f2 = f13 + E;
+      void* amax = f2 + E;
+      kernels::moe::gguf_to_nvfp4(ex.g13_type, ex.g13, ex.g13_row, int(R13), H, int(E), true, amax, c13, s13, f13, s);
+      kernels::moe::gguf_to_nvfp4(ex.g2_type, ex.g2, ex.g2_row, int(R2), INTER, int(E), false, amax, c2, s2, f2, s);
+      me = pk::MoeExperts{0, c13, s13, f13, c2, s2, f2};
+    }
     const pk::MoeQuantScratch q_up = make_moe_q(T, H);
     pk::moe_gate_up(me, xm_, T, work, act_, s, &q_up);
     const pk::MoeQuantScratch q_dn = make_moe_q(T * TOP_K, INTER);

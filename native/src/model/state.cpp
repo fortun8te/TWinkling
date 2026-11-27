@@ -146,6 +146,9 @@ Buffers make_buffers(int m) {
   b.idx = zeros(s, DType::I32, {m, TOP_K});
   b.wts = zeros(s, DType::FP32, {m, TOP_K});
   b.act = zeros(s, DType::BF16, {m, TOP_K, INTER});
+  b.xq8 = zeros(s, DType::U8, {m * (H / 32) * 36});
+  b.actq8 = zeros(s, DType::U8, {m * TOP_K * (INTER / 32) * 36});
+  b.ydown = zeros(s, DType::FP32, {64 * 8 * H});
   b.xf = zeros(s, DType::BF16, {1, m, H});
   b.logits = zeros(s, DType::FP32, {m, UNPADDED_VOCAB});
   b.taps = zeros(s, DType::BF16, {m, NUM_TAPS, H});
@@ -176,6 +179,9 @@ Buffers alias_buffers(const Buffers& base, int m) {
   b.xin = view(base.xin, {3, m, H});
   b.mixf = view(base.mixf, {3, m, H});
   b.msgs = view(base.msgs, {4, m, H});
+  b.xq8 = view(base.xq8, {m * (H / 32) * 36});
+  b.actq8 = view(base.actq8, {m * TOP_K * (INTER / 32) * 36});
+  b.ydown = view(base.ydown, {64 * 8 * H});
   b.xm = view(base.xm, {1, m, H});
   b.mixm = view(base.mixm, {1, m, H});
   b.proj_sliding = view(base.proj_sliding, {m, PROJ_ROWS_SLIDING});

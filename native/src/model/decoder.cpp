@@ -233,6 +233,16 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
                   idx, f32m(b.wts), pdl, stream);
     const Experts& ex = layer.experts;
+    if (ex.gguf()) {
+      moe::quantize_q8_1(bf16m(b.xm), m, H, b.xq8.data, stream);
+      moe::moe_up_gguf(b.xq8.data, m, idx, ex.g13_type, ex.g13, ex.g13_row, bf16m(b.act), stream);
+      moe::quantize_q8_1(bf16m(b.act), m * TOP_K, INTER, b.actq8.data, stream);
+      moe::moe_down_gguf(b.actq8.data, m, idx, f32p(b.wts), ex.g2_type, ex.g2, ex.g2_row, f32m(b.ydown), f32p(layer.mlp_conv),
+                         st.conv_mlp_at(v), f32m(b.y2), history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr,
+                         stream);
+      prev_v = v;
+      continue;
+    }
     const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
     moe::moe_up(bf16m(b.xm), m, idx, ex.w13.data, ex.w13_scale.data,
                 f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);

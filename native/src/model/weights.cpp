@@ -8,6 +8,8 @@
 // parameters are read on the host, widened to FP32 (exact from BF16) and copied.
 #include "model/runtime.h"
 #include "kernels/head/nvfp4_head.h"
+#include "kernels/moe/moe.h"
+#include "model/gguf.h"
 
 #include "core/device.h"
 #include "core/safetensors.h"
@@ -247,6 +249,9 @@ Dense row_view(const Dense& d, int begin, int end) {
   return v;
 }
 
+// GGUF expert mode: set by load_weights for the duration of a load.
+const GgufFile* g_gguf_experts = nullptr;
+
 Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const LayerPlan& plan = LayerPlan{}) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
@@ -375,7 +380,31 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
   ex.fmt = fmt;
-  if (plan.identity()) {
+  if (g_gguf_experts) {
+    if (!plan.identity()) throw std::invalid_argument("weights: GGUF experts need the identity expert plan");
+    const GgufFile& g = *g_gguf_experts;
+    const std::string b = "blk." + std::to_string(l) + ".";
+    const GgufTensorInfo& gu = g.at(b + "ffn_gate_up_exps.weight");
+    const GgufTensorInfo& dn = g.at(b + "ffn_down_exps.weight");
+    if (gu.ne.size() != 3 || gu.ne[0] != std::uint64_t(H) || gu.ne[1] != std::uint64_t(2 * INTER) || gu.ne[2] != EXPERTS ||
+        dn.ne.size() != 3 || dn.ne[0] != std::uint64_t(INTER) || dn.ne[1] != std::uint64_t(H) || dn.ne[2] != EXPERTS)
+      throw std::runtime_error("weights: GGUF layer " + std::to_string(l) + " expert shapes differ");
+    ex.g13_type = gu.type;
+    ex.g2_type = dn.type;
+    ex.g13_row = kernels::moe::gguf_row_bytes(gu.type, H);
+    ex.g2_row = kernels::moe::gguf_row_bytes(dn.type, INTER);
+    if (!ex.g13_row || !ex.g2_row)
+      throw std::runtime_error("weights: GGUF layer " + std::to_string(l) + " has unsupported expert types " +
+                               std::to_string(gu.type) + "/" + std::to_string(dn.type));
+    const std::size_t b13 = ex.g13_row * 2 * INTER * EXPERTS, b2 = ex.g2_row * H * EXPERTS;
+    void* d13 = ld.alloc(b13);
+    void* d2 = ld.alloc(b2);
+    g.read_to_device(gu.offset, b13, d13, ld.stream());
+    g.read_to_device(dn.offset, b2, d2, ld.stream());
+    ex.g13 = d13;
+    ex.g2 = d2;
+    ex.fmt = ExpertFormat::NVFP4;  // the prefill's transcoded layout
+  } else if (plan.identity()) {
     ex.w13 = ld.raw(e + "w13_weight");
     ex.w13_scale = ld.raw(e + "w13_weight_scale");
     ex.w2 = ld.raw(e + "w2_weight");
@@ -388,10 +417,10 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
   }
   const bool nv = fmt == ExpertFormat::NVFP4;
   const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
-  if (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
-      m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales)
+  if (!ex.gguf() && (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
+      m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales))
     throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
-  if (nv) {
+  if (nv && !ex.gguf()) {
     for (const char* w : {"w13", "w2"}) {
       const std::vector<float> amax = host_f32(m, e + w + "_weight_amax");
       const std::vector<float> den = host_f32(m, e + w + "_weight_outer_scale_denominator");
@@ -439,6 +468,12 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   Loader ld(m, up, stream, w.storage, &w.tiered);
   const int H = HIDDEN;
   const std::array<LayerPlan, LAYERS> plan = read_plan(placement.expert_plan);
+  std::unique_ptr<GgufFile> gguf;
+  if (const char* e = std::getenv("INGINE_GGUF_EXPERTS"); e && *e) gguf = std::make_unique<GgufFile>(e);
+  g_gguf_experts = gguf.get();
+  struct Reset {
+    ~Reset() { g_gguf_experts = nullptr; }
+  } reset_gguf;
   for (int l = 0; l < LAYERS; ++l) {
     w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8, plan[l]));
     w.experts_hot[l] = plan[l].hot;

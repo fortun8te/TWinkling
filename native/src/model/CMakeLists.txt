@@ -1,5 +1,6 @@
 add_library(ingine_model STATIC
   weights.cpp
+  gguf.cpp
   state.cpp
   decoder.cpp
   runtime.cpp

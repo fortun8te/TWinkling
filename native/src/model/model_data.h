@@ -136,6 +136,13 @@ struct Experts {
   //        w2_scale u8 [128, 2304, 36], factors empty
   Tensor w13, w13_scale, w2, w2_scale;
   Tensor w13_factor, w2_factor;
+  // GGUF mode (INGINE_GGUF_EXPERTS): every routed expert resident as GGUF blocks in checkpoint order; w13 etc.
+  // above are empty and the prefill transcodes these to NVFP4 per visit.
+  const void* g13 = nullptr;  // ffn_gate_up_exps [128, 2304 (gate | up), 2304]
+  const void* g2 = nullptr;   // ffn_down_exps [128, 2304, 1152]
+  int g13_type = 0, g2_type = 0;
+  std::size_t g13_row = 0, g2_row = 0;
+  bool gguf() const { return g13 != nullptr; }
 };
 
 // weights.Layer plus the per-layer derived tensors of fast.FastDecoder (_concat_projections,
@@ -275,6 +282,8 @@ struct Buffers {
   Tensor idx;                       // int32 [m, 8]
   Tensor wts;                       // fp32 [m, 8]
   Tensor act;                       // bf16 [m, 8, I]
+  Tensor xq8, actq8, ydown;  // ydown: fp32 [64, 8, H] GGUF down-projection rows per slot
+                // GGUF expert mode: Q8_1 blocks of xm [m, H] and act [m * 8, I] (36 B / 32 values)
   Tensor xf;                        // bf16 [1, m, H]
   Tensor logits;                    // fp32 [m, UNPADDED_VOCAB]
   Tensor taps;                      // bf16 [m, 4, H]: partial block entering TAP_VISITS + final normed hidden

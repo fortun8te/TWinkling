@@ -89,6 +89,7 @@ class Prefiller {
   int kpos_rows_;
   float* stats_ = nullptr;
   DeviceBuffer stage_;
+  DeviceBuffer gguf_nv_;  // GGUF expert mode: one layer's experts transcoded to NVFP4 per visit
   int stage_slots_ = 1;
   struct ExpertTransfer;
   std::unique_ptr<ExpertTransfer> transfer_;
