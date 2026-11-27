@@ -4,10 +4,10 @@ from pathlib import Path
 
 here = Path(__file__).resolve().parent
 r = json.loads((here / "results.json").read_text())
-BG, GRID, INK, MUTED = "#141820", "#2b3542", "#edf5fc", "#8fa1b5"
-COL = {"start": "#4a5666", "phase1": "#547ba6", "now": "#7fc4ff"}
+BG, GRID, INK, MUTED = "#050505", "#1c1c1e", "#ffffff", "#8a8a8e"
+COL = {"start": "#3a3a3c", "phase1": "#6e6e73", "now": "#ffffff"}
 NAMES = {"start": "Start", "phase1": "Phase 1", "now": "Now"}
-FONT = "font-family='-apple-system,Segoe UI,Helvetica,Arial,sans-serif'"
+FONT = "font-family='SF Pro Display,-apple-system,Inter,Segoe UI,Helvetica,Arial,sans-serif'"
 
 
 def pct(a, b):
@@ -43,7 +43,7 @@ def grouped(title, sub, data, unit, better_low, fname):
             out.append(f"<text x='{x+bw/2:.1f}' y='{B-h-6:.1f}' fill='{INK if c=='now' else MUTED}' font-size='11.5' text-anchor='middle'>{v:g}</text>")
         d = pct(data[g][0], data[g][-1])
         out.append(f"<text x='{x0+1.5*bw:.1f}' y='{B+22}' fill='{INK}' font-size='13' font-weight='600' text-anchor='middle'>{g}</text>")
-        out.append(f"<text x='{x0+1.5*bw:.1f}' y='{B+40}' fill='#7fc4ff' font-size='12.5' font-weight='650' text-anchor='middle'>{d}</text>")
+        out.append(f"<text x='{x0+1.5*bw:.1f}' y='{B+40}' fill='#ffffff' font-size='12.5' font-weight='650' text-anchor='middle'>{d}</text>")
     lx = W - 24
     for c in reversed(r["columns"]):
         lx -= 78
@@ -72,8 +72,8 @@ for i, (name, a, b, u) in enumerate(rows):
     o.append(f"<text x='28' y='{y+21}' fill='{INK}' font-size='13.5'>{name}</text>")
     o.append(f"<text x='300' y='{y+21}' fill='{MUTED}' font-size='13' text-anchor='end'>{a:g} → <tspan fill='{INK}' font-weight='650'>{b:g}</tspan> {u}</text>")
     o.append(f"<rect x='320' y='{y+10}' width='300' height='12' rx='6' fill='{GRID}'/>")
-    o.append(f"<rect x='320' y='{y+10}' width='{w:.1f}' height='12' rx='6' fill='#7fc4ff'/>")
-    o.append(f"<text x='{W-28}' y='{y+21}' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>{pct(a,b)} · {factor:.1f}×</text>")
+    o.append(f"<rect x='320' y='{y+10}' width='{w:.1f}' height='12' rx='6' fill='#ffffff'/>")
+    o.append(f"<text x='{W-28}' y='{y+21}' fill='#ffffff' font-size='13.5' font-weight='700' text-anchor='end'>{pct(a,b)} · {factor:.1f}×</text>")
 o.append("</svg>")
 (here / "summary.svg").write_text("\n".join(o))
 
@@ -84,7 +84,7 @@ o = [f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {W} {H}' width='{W}'
      f"<rect width='{W}' height='{H}' rx='14' fill='{BG}'/>",
      f"<text x='28' y='36' fill='{INK}' font-size='19' font-weight='650'>Where a 16K decode round goes</text>",
      f"<text x='28' y='56' fill='{MUTED}' font-size='13'>Nsight timeline, PDL-corrected. ~73% of the 893 GB/s byte ceiling.</text>"]
-shades = ["#7fc4ff", "#5c9fd6", "#4a7fae", "#3d6488", "#344c66", "#2d3d50"]
+shades = ["#ffffff", "#c7c7cc", "#98989d", "#6e6e73", "#48484a", "#2c2c2e"]
 x, tot, span = 28.0, sum(prof.values()), W - 56
 for i, (k, v) in enumerate(prof.items()):
     w = span * v / tot

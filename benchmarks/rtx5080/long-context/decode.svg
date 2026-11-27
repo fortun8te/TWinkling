@@ -1,42 +1,42 @@
-<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 760 360' width='760' height='360' font-family='-apple-system,Segoe UI,Helvetica,Arial,sans-serif'>
-<rect width='760' height='360' rx='14' fill='#141820'/>
-<text x='28' y='36' fill='#edf5fc' font-size='19' font-weight='650'>Decode speed</text>
-<text x='28' y='58' fill='#8fa1b5' font-size='13'>tok/s on a real coding task, higher is better</text>
-<line x1='64' x2='736' y1='300.0' y2='300.0' stroke='#2b3542'/>
-<text x='54' y='304.0' fill='#8fa1b5' font-size='11' text-anchor='end'>0</text>
-<line x1='64' x2='736' y1='244.5' y2='244.5' stroke='#2b3542'/>
-<text x='54' y='248.5' fill='#8fa1b5' font-size='11' text-anchor='end'>100</text>
-<line x1='64' x2='736' y1='189.0' y2='189.0' stroke='#2b3542'/>
-<text x='54' y='193.0' fill='#8fa1b5' font-size='11' text-anchor='end'>200</text>
-<line x1='64' x2='736' y1='133.5' y2='133.5' stroke='#2b3542'/>
-<text x='54' y='137.5' fill='#8fa1b5' font-size='11' text-anchor='end'>300</text>
-<line x1='64' x2='736' y1='78.0' y2='78.0' stroke='#2b3542'/>
-<text x='54' y='82.0' fill='#8fa1b5' font-size='11' text-anchor='end'>400</text>
-<rect x='111.4' y='222.9' width='38.4' height='77.1' rx='4' fill='#4a5666'/>
-<text x='130.6' y='216.9' fill='#8fa1b5' font-size='11.5' text-anchor='middle'>139</text>
-<rect x='155.8' y='123.5' width='38.4' height='176.5' rx='4' fill='#547ba6'/>
-<text x='175.0' y='117.5' fill='#8fa1b5' font-size='11.5' text-anchor='middle'>318</text>
-<rect x='200.2' y='136.8' width='38.4' height='163.2' rx='4' fill='#7fc4ff'/>
-<text x='219.4' y='130.8' fill='#edf5fc' font-size='11.5' text-anchor='middle'>294</text>
-<text x='175.0' y='322' fill='#edf5fc' font-size='13' font-weight='600' text-anchor='middle'>16K</text>
-<text x='175.0' y='340' fill='#7fc4ff' font-size='12.5' font-weight='650' text-anchor='middle'>+112%</text>
-<rect x='333.4' y='252.8' width='38.4' height='47.2' rx='4' fill='#4a5666'/>
-<text x='352.6' y='246.8' fill='#8fa1b5' font-size='11.5' text-anchor='middle'>85</text>
-<rect x='377.8' y='195.7' width='38.4' height='104.3' rx='4' fill='#547ba6'/>
-<text x='397.0' y='189.7' fill='#8fa1b5' font-size='11.5' text-anchor='middle'>188</text>
-<rect x='422.2' y='184.6' width='38.4' height='115.4' rx='4' fill='#7fc4ff'/>
-<text x='441.4' y='178.6' fill='#edf5fc' font-size='11.5' text-anchor='middle'>208</text>
-<text x='397.0' y='322' fill='#edf5fc' font-size='13' font-weight='600' text-anchor='middle'>128K</text>
-<text x='397.0' y='340' fill='#7fc4ff' font-size='12.5' font-weight='650' text-anchor='middle'>+145%</text>
-<rect x='555.4' y='268.4' width='38.4' height='31.6' rx='4' fill='#4a5666'/>
-<text x='574.6' y='262.4' fill='#8fa1b5' font-size='11.5' text-anchor='middle'>57</text>
-<rect x='599.8' y='220.6' width='38.4' height='79.4' rx='4' fill='#547ba6'/>
-<text x='619.0' y='214.6' fill='#8fa1b5' font-size='11.5' text-anchor='middle'>143</text>
-<rect x='644.2' y='221.7' width='38.4' height='78.3' rx='4' fill='#7fc4ff'/>
-<text x='663.4' y='215.7' fill='#edf5fc' font-size='11.5' text-anchor='middle'>141</text>
-<text x='619.0' y='322' fill='#edf5fc' font-size='13' font-weight='600' text-anchor='middle'>256K</text>
-<text x='619.0' y='340' fill='#7fc4ff' font-size='12.5' font-weight='650' text-anchor='middle'>+147%</text>
-<rect x='658' y='27' width='10' height='10' rx='2' fill='#7fc4ff'/><text x='673' y='36' fill='#8fa1b5' font-size='12'>Now</text>
-<rect x='580' y='27' width='10' height='10' rx='2' fill='#547ba6'/><text x='595' y='36' fill='#8fa1b5' font-size='12'>Phase 1</text>
-<rect x='502' y='27' width='10' height='10' rx='2' fill='#4a5666'/><text x='517' y='36' fill='#8fa1b5' font-size='12'>Start</text>
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 760 360' width='760' height='360' font-family='SF Pro Display,-apple-system,Inter,Segoe UI,Helvetica,Arial,sans-serif'>
+<rect width='760' height='360' rx='14' fill='#050505'/>
+<text x='28' y='36' fill='#ffffff' font-size='19' font-weight='650'>Decode speed</text>
+<text x='28' y='58' fill='#8a8a8e' font-size='13'>tok/s on a real coding task, higher is better</text>
+<line x1='64' x2='736' y1='300.0' y2='300.0' stroke='#1c1c1e'/>
+<text x='54' y='304.0' fill='#8a8a8e' font-size='11' text-anchor='end'>0</text>
+<line x1='64' x2='736' y1='244.5' y2='244.5' stroke='#1c1c1e'/>
+<text x='54' y='248.5' fill='#8a8a8e' font-size='11' text-anchor='end'>100</text>
+<line x1='64' x2='736' y1='189.0' y2='189.0' stroke='#1c1c1e'/>
+<text x='54' y='193.0' fill='#8a8a8e' font-size='11' text-anchor='end'>200</text>
+<line x1='64' x2='736' y1='133.5' y2='133.5' stroke='#1c1c1e'/>
+<text x='54' y='137.5' fill='#8a8a8e' font-size='11' text-anchor='end'>300</text>
+<line x1='64' x2='736' y1='78.0' y2='78.0' stroke='#1c1c1e'/>
+<text x='54' y='82.0' fill='#8a8a8e' font-size='11' text-anchor='end'>400</text>
+<rect x='111.4' y='222.9' width='38.4' height='77.1' rx='4' fill='#3a3a3c'/>
+<text x='130.6' y='216.9' fill='#8a8a8e' font-size='11.5' text-anchor='middle'>139</text>
+<rect x='155.8' y='123.5' width='38.4' height='176.5' rx='4' fill='#6e6e73'/>
+<text x='175.0' y='117.5' fill='#8a8a8e' font-size='11.5' text-anchor='middle'>318</text>
+<rect x='200.2' y='136.8' width='38.4' height='163.2' rx='4' fill='#ffffff'/>
+<text x='219.4' y='130.8' fill='#ffffff' font-size='11.5' text-anchor='middle'>294</text>
+<text x='175.0' y='322' fill='#ffffff' font-size='13' font-weight='600' text-anchor='middle'>16K</text>
+<text x='175.0' y='340' fill='#ffffff' font-size='12.5' font-weight='650' text-anchor='middle'>+112%</text>
+<rect x='333.4' y='252.8' width='38.4' height='47.2' rx='4' fill='#3a3a3c'/>
+<text x='352.6' y='246.8' fill='#8a8a8e' font-size='11.5' text-anchor='middle'>85</text>
+<rect x='377.8' y='195.7' width='38.4' height='104.3' rx='4' fill='#6e6e73'/>
+<text x='397.0' y='189.7' fill='#8a8a8e' font-size='11.5' text-anchor='middle'>188</text>
+<rect x='422.2' y='184.6' width='38.4' height='115.4' rx='4' fill='#ffffff'/>
+<text x='441.4' y='178.6' fill='#ffffff' font-size='11.5' text-anchor='middle'>208</text>
+<text x='397.0' y='322' fill='#ffffff' font-size='13' font-weight='600' text-anchor='middle'>128K</text>
+<text x='397.0' y='340' fill='#ffffff' font-size='12.5' font-weight='650' text-anchor='middle'>+145%</text>
+<rect x='555.4' y='268.4' width='38.4' height='31.6' rx='4' fill='#3a3a3c'/>
+<text x='574.6' y='262.4' fill='#8a8a8e' font-size='11.5' text-anchor='middle'>57</text>
+<rect x='599.8' y='220.6' width='38.4' height='79.4' rx='4' fill='#6e6e73'/>
+<text x='619.0' y='214.6' fill='#8a8a8e' font-size='11.5' text-anchor='middle'>143</text>
+<rect x='644.2' y='221.7' width='38.4' height='78.3' rx='4' fill='#ffffff'/>
+<text x='663.4' y='215.7' fill='#ffffff' font-size='11.5' text-anchor='middle'>141</text>
+<text x='619.0' y='322' fill='#ffffff' font-size='13' font-weight='600' text-anchor='middle'>256K</text>
+<text x='619.0' y='340' fill='#ffffff' font-size='12.5' font-weight='650' text-anchor='middle'>+147%</text>
+<rect x='658' y='27' width='10' height='10' rx='2' fill='#ffffff'/><text x='673' y='36' fill='#8a8a8e' font-size='12'>Now</text>
+<rect x='580' y='27' width='10' height='10' rx='2' fill='#6e6e73'/><text x='595' y='36' fill='#8a8a8e' font-size='12'>Phase 1</text>
+<rect x='502' y='27' width='10' height='10' rx='2' fill='#3a3a3c'/><text x='517' y='36' fill='#8a8a8e' font-size='12'>Start</text>
 </svg>
