@@ -60,6 +60,16 @@ Setup builds the SM120a server, verifies the model download and converts layers 
 
 The `32k`, `128k` and `256k` profiles are the exact recipes measured above. Every profile keeps all experts and the original model behaviour; placement only decides which experts live in VRAM.
 
+### Images
+
+TWinkling is text-only by default, which keeps 0.6 GB of VRAM for experts. Set `TWINKLING_VISION=1` to load the image tower:
+
+```bash
+TWINKLING_VISION=1 TWINKLING_PROFILE=256k bash scripts/rtx5080/serve-5080.sh
+```
+
+At 256K this uses a 9.6 GiB expert plan so the card keeps about 730 MiB free. Measured on the RTX 5080 at 250 W, decode is about 12% slower than text-only; image answers were correct in our check.
+
 ```bash
 curl --fail http://127.0.0.1:18298/v1/chat/completions \
   -H 'Content-Type: application/json' \

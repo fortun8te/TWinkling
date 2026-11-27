@@ -10,6 +10,7 @@ if [[ "${1:-}" == --help ]]; then
   echo 'Start TWinkling on localhost. TWINKLING_PROFILE=64k (default), 32k (fastest), 128k, or 256k.'
   echo 'Optional environment settings: TWINKLING_MODEL_DIR, TWINKLING_SERVER, TWINKLING_EXPERT_PLAN, TWINKLING_PORT.'
   echo 'Experimental: TWINKLING_CONTEXT, TWINKLING_PREFILL_CHUNK, TWINKLING_KV=fp8|v4|k4, TWINKLING_PREFILL_OVERLAP=1, TWINKLING_PARK_HOST_MIB.'
+  echo 'TWINKLING_VISION=1 loads the image tower (0.6 GB) so requests can include images; on 256k it uses a smaller expert plan, about 12% slower decode.'
   exit 0
 fi
 if [[ $# -gt 0 ]]; then
@@ -26,6 +27,13 @@ case "$profile" in
   *) echo 'TWINKLING_PROFILE must be 32k, 64k, 128k, or 256k.' >&2; exit 2 ;;
 esac
 plan="${TWINKLING_EXPERT_PLAN:-${experts:+$root/config/$experts}}"
+no_vision=--no-vision
+if [[ "${TWINKLING_VISION:-0}" == 1 ]]; then
+  no_vision=
+  if [[ -z "${TWINKLING_EXPERT_PLAN:-}" && "$profile" == 256k ]]; then
+    plan="$root/config/rtx5080-experts-256k-vision.json"
+  fi
+fi
 ctx="${TWINKLING_CONTEXT:-$capacity}"
 chunk="${TWINKLING_PREFILL_CHUNK:-$width}"
 cache="${TWINKLING_KV:-$precision}"
@@ -35,7 +43,7 @@ cache="${TWINKLING_KV:-$precision}"
   exit 1
 }
 args=(--engine --model-dir "$model" --host 127.0.0.1 --port "$port" --max-ctx "$ctx"
-      --dense-fp8 --spec --spec-threshold 0.8 --no-vision --park-mb 0 --embed-host
+      --dense-fp8 --spec --spec-threshold 0.8 $no_vision --park-mb 0 --embed-host
       --prefill-chunk "$chunk" --prefill-stage-mib "$stage" --max-queue 8)
 if [[ -n "$plan" ]]; then args+=(--expert-plan "$plan"); fi
 case "$cache" in
