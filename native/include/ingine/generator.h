@@ -124,6 +124,7 @@ struct RuntimeOptions {
   int prefill_stage_mib = 0;
   bool prefill_overlap = false;  // overlap the next expert copy with the current visit's non-expert work
   bool kv_v4 = false;  // symmetric INT4 global values, requires FP8 global keys
+  bool kv_k4 = false;  // symmetric INT4 global keys + values (K4/V4)
   bool elastic_kv = false;  // reserve stable global-KV addresses and map device pages as needed
 };
 

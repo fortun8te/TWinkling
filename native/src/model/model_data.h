@@ -232,7 +232,7 @@ struct Ablation {
 // model.State: per-request caches.
 struct State {
   int max_ctx = 0;
-  bool kv_fp8 = false, kv_v4 = false;
+  bool kv_fp8 = false, kv_v4 = false, kv_k4 = false;
   Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
   Tensor k_full, v_full;      // global caches [8, max_ctx, 8, bytes or elements per head]

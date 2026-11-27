@@ -70,6 +70,7 @@ struct AttnPrepParams {
   void* v_out = nullptr;
   bool out_fp8 = false;
   bool out_v4 = false;
+  bool out_k4 = false;
 };
 // model._qkv per token: q (scale, clip, tau, BF16), rel (scale, clip, tau, BF16), keys/values through the
 // static (sliding) or dynamic (full) conv, BF16, key clip / value RMS norm, stored at the cache precision.
@@ -85,6 +86,7 @@ struct AttnParams {
   const void* v = nullptr;
   bool kv_fp8 = false;
   bool kv_v4 = false;
+  bool kv_k4 = false;
   const int* kpos = nullptr;         // positions of the L keys (padded to tiles with -1), or null: key j at j
   const int4* bounds = nullptr;      // key_tile_bounds of kpos (with kpos)
   int L = 0;

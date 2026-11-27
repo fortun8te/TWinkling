@@ -74,10 +74,10 @@ class EngineGenerator final : public Generator {
       taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
       spec_ = std::make_unique<SpecLoop>(rt_, *drafter_);
     }
-    // checkpoint layout: target state | drafter context | last prompt logits
+    // checkpoint layout: target state | drafter context | last prompt logits (in pinned host RAM to free ~300 MiB VRAM)
     checkpoint_drafter_ = carved(rt_.checkpoint_bytes());
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
-    checkpoint_ = DeviceBuffer(checkpoint_logits_ + logits_.bytes);
+    checkpoint_ = std::make_unique<PinnedHostBuffer>(checkpoint_logits_ + logits_.bytes);
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
@@ -465,14 +465,14 @@ class EngineGenerator final : public Generator {
     }
     p.bytes = l.bytes;
     char* d = p.data();
-    const char* c = static_cast<const char*>(checkpoint_.p);
+    const char* c = static_cast<const char*>(checkpoint_->data());
     const cudaStream_t s = rt_.stream();
     const cudaMemcpyKind direction = p.host ? cudaMemcpyDeviceToHost : cudaMemcpyDeviceToDevice;
-    CUDA_CHECK(cudaMemcpyAsync(d, c, checkpoint_drafter_, direction, s));
+    CUDA_CHECK(cudaMemcpyAsync(d, c, checkpoint_drafter_, cudaMemcpyDefault, s));
     for (int i = 0; i < 3 && drafter_; ++i)
       CUDA_CHECK(cudaMemcpyAsync(d + l.drafter_off[i], c + checkpoint_drafter_ + l.drafter[i].offset,
-                                 l.drafter[i].bytes, direction, s));
-    CUDA_CHECK(cudaMemcpyAsync(d + l.logits, c + checkpoint_logits_, logits_.bytes, direction, s));
+                                 l.drafter[i].bytes, cudaMemcpyDefault, s));
+    CUDA_CHECK(cudaMemcpyAsync(d + l.logits, c + checkpoint_logits_, logits_.bytes, cudaMemcpyDefault, s));
     rt_.save_full_rows(d + l.rows, int(n), direction);
     p.used = ++clock_;
     parked_.push_back(std::move(p));
@@ -484,36 +484,36 @@ class EngineGenerator final : public Generator {
     const int n = int(p.ids.size());
     const ParkLayout l = park_layout(n);
     const char* d = p.data();
-    char* c = static_cast<char*>(checkpoint_.p);
+    char* c = static_cast<char*>(checkpoint_->data());
     const cudaStream_t s = rt_.stream();
     const cudaMemcpyKind direction = p.host ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
-    CUDA_CHECK(cudaMemcpyAsync(c, d, checkpoint_drafter_, direction, s));
+    CUDA_CHECK(cudaMemcpyAsync(c, d, checkpoint_drafter_, cudaMemcpyDefault, s));
     for (int i = 0; i < 3 && drafter_; ++i)
       CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_drafter_ + l.drafter[i].offset, d + l.drafter_off[i],
-                                 l.drafter[i].bytes, direction, s));
-    CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, d + l.logits, logits_.bytes, direction, s));
+                                 l.drafter[i].bytes, cudaMemcpyDefault, s));
+    CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, d + l.logits, logits_.bytes, cudaMemcpyDefault, s));
     rt_.restore_full_rows(d + l.rows, n, direction);
     if (drafter_) drafter_->adopt_checkpoint(c + checkpoint_drafter_, n, p.context);
     checkpoint_ids_ = p.ids;
     p.used = ++clock_;
   }
 
-  // The checkpoint (on the device): target state (Runtime::save_checkpoint) | drafter context
+  // The checkpoint (in pinned host RAM): target state (Runtime::save_checkpoint) | drafter context
   // (Drafter::save_checkpoint) | logits of the last prompt token.
   void save_checkpoint() {
-    char* p = static_cast<char*>(checkpoint_.p);
+    char* p = static_cast<char*>(checkpoint_->data());
     rt_.save_checkpoint(p);
     if (drafter_) drafter_->save_checkpoint(p + checkpoint_drafter_);
-    CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
+    CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDefault,
                                rt_.stream()));
     checkpoint_ids_ = tokens_in_state_;
   }
 
   void restore_checkpoint() {
-    const char* p = static_cast<const char*>(checkpoint_.p);
+    const char* p = static_cast<const char*>(checkpoint_->data());
     rt_.restore_checkpoint(p);
     if (drafter_) drafter_->restore_checkpoint(p + checkpoint_drafter_);
-    CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice,
+    CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDefault,
                                rt_.stream()));
     tokens_in_state_ = checkpoint_ids_;
   }
@@ -545,7 +545,7 @@ class EngineGenerator final : public Generator {
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   PinnedHostBuffer host_token_;
   // prompt checkpoint (save_checkpoint) and the prompt it holds (empty: none)
-  DeviceBuffer checkpoint_;
+  std::unique_ptr<PinnedHostBuffer> checkpoint_;
   std::size_t checkpoint_drafter_ = 0, checkpoint_logits_ = 0;  // byte offsets in checkpoint_
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;

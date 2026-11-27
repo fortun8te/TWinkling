@@ -324,17 +324,20 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
     if (layer.full) {
       const int fi = FULL_INDEX[v];
-      const std::size_t es = st.kv_fp8 ? 1 : 2, off = std::size_t(pos0) * KV_DIM * es;
-      void* kc = st.k_full_at(fi).data;
+      const Tensor k_cache = st.k_full_at(fi);
+      void* kc = k_cache.data;
+      const std::size_t off = std::size_t(pos0) * (k_cache.bytes() / st.max_ctx);
       const Tensor v_cache = st.v_full_at(fi);
       void* vc = v_cache.data;
       const std::size_t v_off = std::size_t(pos0) * (v_cache.bytes() / st.max_ctx);
       ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + v_off, ap.out_fp8 = st.kv_fp8;
       ap.out_v4 = st.kv_v4;
+      ap.out_k4 = st.kv_k4;
       pk::attn_prep(ap, s);
       at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;
       at.window = 0;
       at.kv_v4 = st.kv_v4;
+      at.kv_k4 = st.kv_k4;
     } else {
       const int ri = RING_INDEX[v];
       auto* k_ring = static_cast<__nv_bfloat16*>(st.k_ring_at(ri).data);

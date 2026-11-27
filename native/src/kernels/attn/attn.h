@@ -26,6 +26,7 @@ struct DecodeArgs {
   void* v_cache = nullptr;
   bool cache_fp8 = false;
   bool cache_v4 = false;  // only when cache_fp8 and window == 0
+  bool cache_k4 = false;  // symmetric INT4 global keys (requires cache_v4 and window == 0)
   std::int64_t cache_rows = 0;      // 1024 (sliding) or max_ctx (full), at most 2^30
   std::int64_t* kpos = nullptr;     // sliding: int64 [1024] slot positions (-1 = empty); full: unused
   const std::int64_t* pos = nullptr;  // int64 device, pos[0] = position of the first token

@@ -44,7 +44,7 @@ class Drafter {
  public:
   static constexpr int BLOCK = kernels::draft::BLOCK;  // 8 rows per drafted block
   static constexpr int GAMMA = kernels::draft::GAMMA;  // 7 drafts per round
-  static constexpr int DRAFT_CTX = 65536;              // global-layer ring slots (at most)
+  static constexpr int DRAFT_CTX = 16384;              // global-layer ring slots (at most; saves 96 MiB VRAM + 4x faster draft attn)
   static constexpr int SHORTLIST_ROWS = 32768;         // ranked tokens in the shortlist head
   static constexpr int CONTEXT_ROWS = 16384;           // context tokens added to it (until reset())
 
@@ -146,6 +146,7 @@ class Drafter {
   };
 
   void* alloc(std::size_t bytes);
+  void* alloc_host(std::size_t bytes);
   void load(const std::filesystem::path& model_dir);
   void run_draft(int bucket);
   void run_layers(int bucket);                                                  // a draft after its input rows
@@ -167,6 +168,7 @@ class Drafter {
   bool checkpoint_clobbered_ = false;
   void global_written(int begin, int end);  // positions [begin, end) written into the global ring
   std::vector<DeviceBuffer> storage_;
+  std::vector<MappedHostBuffer> host_storage_;
   kernels::draft::Bf16Gemm gemm_;
 
   std::array<DraftLayer, 3> layers_{};

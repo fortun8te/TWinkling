@@ -135,8 +135,8 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const AttnPrepParams p) 
       for (int q = 0; q < 4; ++q) y[q] = round_bf16(y[q] * r);
     }
     void* dst = kv == 0 ? p.k_out : p.v_out;
-    if (p.out_v4 && kv == 1) {
-      value4::store(value4::head(static_cast<char*>(p.v_out), size_t(t) * kKvHeads + warp), lane, y);
+    if ((p.out_v4 && kv == 1) || (p.out_k4 && kv == 0)) {
+      value4::store(value4::head(static_cast<char*>(dst), size_t(t) * kKvHeads + warp), lane, y);
     } else if (p.out_fp8) {  // State.full_store: saturate to +-448, E4M3 round to nearest even
       const uint32_t b = uint32_t(f2e4m3(y[0])) | (uint32_t(f2e4m3(y[1])) << 8) | (uint32_t(f2e4m3(y[2])) << 16) |
                          (uint32_t(f2e4m3(y[3])) << 24);

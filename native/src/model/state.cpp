@@ -27,6 +27,11 @@ Tensor State::v_ring_at(int ring) const {
 }
 std::int64_t* State::ring_pos_at(int ring) const { return ptr<std::int64_t>(ring_pos) + std::size_t(ring) * WINDOW; }
 Tensor State::k_full_at(int full) const {
+  if (kv_k4) {
+    constexpr int bytes = kernels::value4::kHeadBytes;
+    void* data = elastic() ? elastic_k.at(full).data() : ptr<char>(k_full) + std::size_t(full) * max_ctx * KV_HEADS * bytes;
+    return rm(data, DType::U8, {max_ctx, KV_HEADS, bytes});
+  }
   const std::size_t es = kv_fp8 ? 1 : 2;
   void* data = elastic() ? elastic_k.at(full).data() : ptr<char>(k_full) + std::size_t(full) * max_ctx * KV_DIM * es;
   return rm(data, kv_fp8 ? DType::FP8_E4M3FN : DType::BF16, {max_ctx, KV_HEADS, HEAD_DIM});
@@ -45,8 +50,10 @@ Tensor State::v_full_at(int full) const {
 void State::ensure_full_rows(int rows) {
   if (!elastic()) return;
   if (rows < 0 || rows > max_ctx) throw std::invalid_argument("elastic KV rows exceed max_ctx");
-  const std::size_t k_bytes = std::size_t(rows) * KV_DIM * (kv_fp8 ? 1 : 2);
-  const std::size_t v_bytes = kv_v4 ? std::size_t(rows) * KV_HEADS * kernels::value4::kHeadBytes : k_bytes;
+  const std::size_t k_bytes = kv_k4 ? std::size_t(rows) * KV_HEADS * kernels::value4::kHeadBytes
+                                    : std::size_t(rows) * KV_DIM * (kv_fp8 ? 1 : 2);
+  const std::size_t v_bytes = kv_v4 ? std::size_t(rows) * KV_HEADS * kernels::value4::kHeadBytes
+                                    : std::size_t(rows) * KV_DIM * (kv_fp8 ? 1 : 2);
   std::array<std::size_t, NUM_FULL_VISITS> old_k{}, old_v{};
   for (int i = 0; i < NUM_FULL_VISITS; ++i) {
     old_k[i] = elastic_k[i].mapped_bytes();
@@ -66,28 +73,33 @@ void State::ensure_full_rows(int rows) {
   }
 }
 
-State make_state(int max_ctx, bool kv_fp8, bool kv_v4, bool elastic_kv) {
+State make_state(int max_ctx, bool kv_fp8, bool kv_v4, bool elastic_kv, bool kv_k4) {
   if (kv_v4 && !kv_fp8) throw std::invalid_argument("INT4 global values require FP8 global keys");
+  if (kv_k4 && !kv_v4) throw std::invalid_argument("INT4 global keys require INT4 global values");
   // the attention kernel keeps positions in int32 and caps full caches at 2^30 rows
   if (max_ctx < 1 || max_ctx > (1 << 30)) throw std::invalid_argument("max_ctx must be in 1..2^30");
   State st;
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
   st.kv_v4 = kv_v4;
+  st.kv_k4 = kv_k4;
   const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
   st.k_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.v_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
   if (elastic_kv) {
-    const std::size_t k_bytes = std::size_t(max_ctx) * KV_DIM * dtype_size(full);
-    const std::size_t v_bytes = kv_v4 ? std::size_t(max_ctx) * KV_HEADS * kernels::value4::kHeadBytes : k_bytes;
+    const std::size_t k_bytes = kv_k4 ? std::size_t(max_ctx) * KV_HEADS * kernels::value4::kHeadBytes
+                                      : std::size_t(max_ctx) * KV_DIM * dtype_size(full);
+    const std::size_t v_bytes = kv_v4 ? std::size_t(max_ctx) * KV_HEADS * kernels::value4::kHeadBytes
+                                      : std::size_t(max_ctx) * KV_DIM * dtype_size(full);
     for (int i = 0; i < NUM_FULL_VISITS; ++i) {
       st.elastic_k[i] = GrowableBuffer(k_bytes);
       st.elastic_v[i] = GrowableBuffer(v_bytes);
     }
   } else {
-    st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
+    st.k_full = kv_k4 ? zeros(st.storage, DType::U8, {NUM_FULL_VISITS, max_ctx, KV_HEADS, kernels::value4::kHeadBytes})
+                      : zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
     st.v_full = kv_v4 ? zeros(st.storage, DType::U8, {NUM_FULL_VISITS, max_ctx, KV_HEADS, kernels::value4::kHeadBytes})
                       : zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
   }

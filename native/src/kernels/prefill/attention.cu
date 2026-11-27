@@ -56,7 +56,7 @@ struct KvRegs {
   int kp;
 };
 
-template <bool FP8, bool EXPLICIT, bool V4 = false>
+template <bool FP8, bool EXPLICIT, bool V4 = false, bool K4 = false>
 __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, KvRegs<FP8>& r) {
   const int tid = threadIdx.x;
   if constexpr (FP8) {
@@ -68,7 +68,14 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
       const int j = j0 + row;
       if (j < p.L) {
         const size_t off = size_t(j) * kKvDim + g * D + c * 16;
-        r.k[i] = __ldg(reinterpret_cast<const uint4*>(K + off));
+        if constexpr (K4) {
+          const auto k = value4::head(static_cast<const char*>(p.k), size_t(j) * kKvHeads + g);
+          const uint2 bits = __ldg(reinterpret_cast<const uint2*>(k.packed) + c);
+          const auto scale = __ldg(reinterpret_cast<const uint32_t*>(k.scale));
+          r.k[i] = make_uint4(bits.x, bits.y, scale, 0);
+        } else {
+          r.k[i] = __ldg(reinterpret_cast<const uint4*>(K + off));
+        }
         if constexpr (V4) {
           const auto v = value4::head(static_cast<const char*>(p.v), size_t(j) * kKvHeads + g);
           const uint2 bits = __ldg(reinterpret_cast<const uint2*>(v.packed) + c);
@@ -117,7 +124,13 @@ __device__ __forceinline__ uint32_t v4_pair_to_half2(uint32_t bits, float scale)
   return pack_half2(rounded.x, rounded.y);
 }
 
-template <bool FP8, bool EXPLICIT, bool V4 = false>
+__device__ __forceinline__ uint32_t v4_pair_to_bf16x2(uint32_t bits, float scale) {
+  const float low = float(int(bits & 15u) - 8) * scale;
+  const float high = float(int((bits >> 4) & 15u) - 8) * scale;
+  return pack_bf16x2(low, high);
+}
+
+template <bool FP8, bool EXPLICIT, bool V4 = false, bool K4 = false>
 __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& r) {
   const int tid = threadIdx.x;
   if constexpr (FP8) {
@@ -127,10 +140,18 @@ __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& 
       const uint32_t kw[4] = {r.k[i].x, r.k[i].y, r.k[i].z, r.k[i].w};
       const uint32_t vw[4] = {r.v[i].x, r.v[i].y, r.v[i].z, r.v[i].w};
       uint4 k0, k1, v0, v1;
-      k0.x = e4m3x2_to_bf16x2(kw[0] & 0xffff); k0.y = e4m3x2_to_bf16x2(kw[0] >> 16);
-      k0.z = e4m3x2_to_bf16x2(kw[1] & 0xffff); k0.w = e4m3x2_to_bf16x2(kw[1] >> 16);
-      k1.x = e4m3x2_to_bf16x2(kw[2] & 0xffff); k1.y = e4m3x2_to_bf16x2(kw[2] >> 16);
-      k1.z = e4m3x2_to_bf16x2(kw[3] & 0xffff); k1.w = e4m3x2_to_bf16x2(kw[3] >> 16);
+      if constexpr (K4) {
+        const float kscale = __uint_as_float(kw[2]);
+        k0 = make_uint4(v4_pair_to_bf16x2(kw[0], kscale), v4_pair_to_bf16x2(kw[0] >> 8, kscale),
+                        v4_pair_to_bf16x2(kw[0] >> 16, kscale), v4_pair_to_bf16x2(kw[0] >> 24, kscale));
+        k1 = make_uint4(v4_pair_to_bf16x2(kw[1], kscale), v4_pair_to_bf16x2(kw[1] >> 8, kscale),
+                        v4_pair_to_bf16x2(kw[1] >> 16, kscale), v4_pair_to_bf16x2(kw[1] >> 24, kscale));
+      } else {
+        k0.x = e4m3x2_to_bf16x2(kw[0] & 0xffff); k0.y = e4m3x2_to_bf16x2(kw[0] >> 16);
+        k0.z = e4m3x2_to_bf16x2(kw[1] & 0xffff); k0.w = e4m3x2_to_bf16x2(kw[1] >> 16);
+        k1.x = e4m3x2_to_bf16x2(kw[2] & 0xffff); k1.y = e4m3x2_to_bf16x2(kw[2] >> 16);
+        k1.z = e4m3x2_to_bf16x2(kw[3] & 0xffff); k1.w = e4m3x2_to_bf16x2(kw[3] >> 16);
+      }
       if constexpr (V4) {
         const float scale = __uint_as_float(vw[2]);
         v0 = make_uint4(v4_pair_to_half2(vw[0], scale), v4_pair_to_half2(vw[0] >> 8, scale),
@@ -166,7 +187,7 @@ __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& 
   }
 }
 
-template <bool FP8, bool EXPLICIT, bool V4 = false>
+template <bool FP8, bool EXPLICIT, bool V4 = false, bool K4 = false>
 __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
   Smem& s = *reinterpret_cast<Smem*>(smem_raw);
@@ -241,15 +262,15 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
 
   KvRegs<FP8> regs;
   if (ntiles > 0) {
-    load_tile<FP8, EXPLICIT, V4>(p, g, tile_at(0) * BK, regs);
-    store_tile<FP8, EXPLICIT, V4>(s, 0, regs);
+    load_tile<FP8, EXPLICIT, V4, K4>(p, g, tile_at(0) * BK, regs);
+    store_tile<FP8, EXPLICIT, V4, K4>(s, 0, regs);
   }
   __syncthreads();
 
 #pragma unroll 1
   for (int i = 0; i < ntiles; ++i) {
     const int kt = tile_at(i), buf = i & 1;
-    if (i + 1 < ntiles) load_tile<FP8, EXPLICIT, V4>(p, g, tile_at(i + 1) * BK, regs);
+    if (i + 1 < ntiles) load_tile<FP8, EXPLICIT, V4, K4>(p, g, tile_at(i + 1) * BK, regs);
 
     // tile class (uniform over the CTA)
     int kmin, kmax;
@@ -288,7 +309,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     }
     // stage the next tile now (its buffer was last read before the previous barrier): the conversion and the
     // shared stores overlap the Q.K^T MMAs in flight instead of trailing the P.V MMAs
-    if (i + 1 < ntiles) store_tile<FP8, EXPLICIT, V4>(s, buf ^ 1, regs);
+    if (i + 1 < ntiles) store_tile<FP8, EXPLICIT, V4, K4>(s, buf ^ 1, regs);
 
     // ---- scores (log2 units), bias, mask
     float rmax[2] = {m[0], m[1]};
@@ -389,13 +410,13 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   }
 }
 
-template <bool FP8, bool EXPLICIT, bool V4 = false>
+template <bool FP8, bool EXPLICIT, bool V4 = false, bool K4 = false>
 void launch(const AttnParams& p, cudaStream_t stream) {
   static const cudaError_t attr =
-      cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT, V4>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem)));
+      cudaFuncSetAttribute(attn_kernel<FP8, EXPLICIT, V4, K4>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sizeof(Smem)));
   if (attr != cudaSuccess) throw std::runtime_error("prefill attention: shared memory attribute failed");
   const dim3 grid((GQA * p.T + BR - 1) / BR, kKvHeads);
-  attn_kernel<FP8, EXPLICIT, V4><<<grid, NT, sizeof(Smem), stream>>>(p);
+  attn_kernel<FP8, EXPLICIT, V4, K4><<<grid, NT, sizeof(Smem), stream>>>(p);
 }
 
 // ---- sliding-visit key rows
@@ -453,10 +474,14 @@ void attention(const AttnParams& p, cudaStream_t stream) {
   const bool expl = p.kpos != nullptr;
   if (expl && (!p.bounds || (p.L + BK - 1) / BK > kAttnMaxTiles))
     throw std::invalid_argument("prefill attention: explicit key tiles exceed the bounded layout or lack bounds");
-  if (p.kv_v4) {
+  if (p.kv_k4) {
+    if (!p.kv_v4 || !p.kv_fp8 || expl || p.window != 0)
+      throw std::invalid_argument("prefill attention: INT4 keys require K4/V4 on a full visit");
+    launch<true, false, true, true>(p, stream);
+  } else if (p.kv_v4) {
     if (!p.kv_fp8 || expl || p.window != 0)
       throw std::invalid_argument("prefill attention: INT4 values require FP8 keys on a full visit");
-    launch<true, false, true>(p, stream);
+    launch<true, false, true, false>(p, stream);
   } else if (p.kv_fp8) {
     if (expl) launch<true, true>(p, stream);
     else launch<true, false>(p, stream);

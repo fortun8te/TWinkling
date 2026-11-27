@@ -104,6 +104,7 @@ namespace cs8 {
 constexpr int CS = 8;
 #include "kernels/attn/attn_impl.cuh"
 }  // namespace cs8
+#include "kernels/attn/splitk.cuh"
 
 namespace {
 bool use16() {
@@ -120,7 +121,8 @@ bool use16() {
 int cluster_size() { return use16() ? 16 : 8; }
 
 std::size_t workspace_bytes(int max_m) {
-    return std::max(cs16::workspace_bytes_impl(max_m), cs8::workspace_bytes_impl(max_m));
+    return std::max({cs16::workspace_bytes_impl(max_m), cs8::workspace_bytes_impl(max_m),
+                     splitk::workspace_bytes(max_m)});
 }
 
 int max_active_clusters(int M, int window) {
@@ -128,6 +130,10 @@ int max_active_clusters(int M, int window) {
 }
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
+    if (!use16() && a.window == 0 && a.cache_fp8) {
+        splitk::attn_decode_splitk(a, stream);
+        return;
+    }
     if (use16()) cs16::attn_decode_impl(a, stream);
     else cs8::attn_decode_impl(a, stream);
 }

@@ -79,7 +79,7 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_v4, options.elastic_kv);
+  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_v4, options.elastic_kv, options.kv_k4);
   state_.ensure_full_rows(kMaxWidth);  // eager graph warmup writes starting at position 0
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));

@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false, embed_host = false;
-  bool kv_v4 = false, prefill_overlap = false;
+  bool kv_v4 = false, kv_k4 = false, prefill_overlap = false;
   bool suffix_draft = false, elastic_kv = false;
   int spec_shortlist_rows = 32768;
   int prefill_chunk = 3072, prefill_stage_mib = 0;
@@ -160,6 +160,7 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "", &dense_fp8);
   ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
   ap.flag("--kv-v4", "FP8 global keys and compact 4-bit global values (experimental)", &kv_v4);
+  ap.flag("--kv-k4", "compact 4-bit global keys and values (K4/V4)", &kv_k4);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
   ap.flag("--suffix-draft", "verified greedy history lookup", &suffix_draft);
   ap.option("--draft-shortlist", "", "number of ranked DSpark head rows (1..32768)", &spec_shortlist_rows);
@@ -202,8 +203,9 @@ int main(int argc, char** argv) {
     options.ablation = ablation;
     options.max_ctx = max_ctx;
     options.dense_fp8 = dense_fp8;
-    options.kv_fp8 = kv_fp8 || kv_v4;
-    options.kv_v4 = kv_v4;
+    options.kv_fp8 = kv_fp8 || kv_v4 || kv_k4;
+    options.kv_v4 = kv_v4 || kv_k4;
+    options.kv_k4 = kv_k4;
     options.elastic_kv = elastic_kv;
     options.spec = spec;
     options.suffix_draft = suffix_draft;

@@ -58,6 +58,11 @@ void* Drafter::alloc(std::size_t bytes) {
   return storage_.back().p;
 }
 
+void* Drafter::alloc_host(std::size_t bytes) {
+  host_storage_.emplace_back(bytes);
+  return host_storage_.back().device_ptr();
+}
+
 Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
                  int shortlist_rows)
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)) {
@@ -289,15 +294,20 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   final_norm_ = persist({{"norm.weight", {h}}});
   mask_embed_ = persist({{"mask_embed", {h}}});
   const std::string mh = "markov_head.";
-  w1_ = persist({{mh + "markov_w1.weight", {f.at(mh + "markov_w1.weight").shape.at(0), kd::RANK}}});
-  if (f.at(mh + "markov_w1.weight").shape.at(0) < V_)
-    throw std::runtime_error("mtp.safetensors: markov_w1 has fewer rows than the vocabulary");
+  {
+    const SafetensorsTensor& t = f.at(mh + "markov_w1.weight");
+    if (t.dtype != "BF16" || t.shape.size() != 2 || t.shape[1] != kd::RANK || t.shape[0] < V_)
+      throw std::runtime_error("mtp.safetensors: markov_w1 has unexpected shape");
+    void* dst = alloc_host(t.bytes);
+    std::memcpy(host_storage_.back().data(), static_cast<const std::byte*>(raw.host.data()) + (t.offset - base), t.bytes);
+    w1_ = static_cast<const __nv_bfloat16*>(dst);
+  }
   rnn_w_ = persist({{mh + "rnn_proj.weight", {kd::RNN_OUT, kd::RNN_IN}}});
   rnn_b_ = persist({{mh + "rnn_proj.bias", {kd::RNN_OUT}}});
   f_norm_ = persist({{mh + "dflare_norm.weight", {h}}});
 
-  // fold_w / fold_b (FP64, from the unembedding as the decoder stores it)
-  fold_w_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(V_) * kd::RANK * 2));
+  // fold_w / fold_b (FP64, from the unembedding as the decoder stores it); fold_w in mapped pinned host RAM frees 102 MiB VRAM
+  fold_w_ = static_cast<__nv_bfloat16*>(alloc_host(std::size_t(V_) * kd::RANK * 2));
   fold_b_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(V_) * 2));
   const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});

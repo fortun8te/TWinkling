@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
   int prefill_stage_mib = 0;
   std::string expert_plan;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
-  bool kv_v4 = false, prefill_overlap = false;
+  bool kv_v4 = false, kv_k4 = false, prefill_overlap = false;
   bool suffix_draft = false, elastic_kv = false, profile_spec = false, profile_experts = false;
   int spec_shortlist_rows = 32768;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
@@ -101,6 +101,7 @@ int main(int argc, char** argv) {
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
   ap.flag("--kv-v4", "FP8 global keys and compact 4-bit global values (experimental)", &kv_v4);
+  ap.flag("--kv-k4", "compact 4-bit global keys and values (K4/V4)", &kv_k4);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-mb", "",
@@ -179,8 +180,9 @@ int main(int argc, char** argv) {
       options.ablation = ablation;
       options.max_ctx = max_ctx;
       options.dense_fp8 = dense_fp8;
-      options.kv_fp8 = kv_fp8 || kv_v4;
-      options.kv_v4 = kv_v4;
+      options.kv_fp8 = kv_fp8 || kv_v4 || kv_k4;
+      options.kv_v4 = kv_v4 || kv_k4;
+      options.kv_k4 = kv_k4;
       options.elastic_kv = elastic_kv;
       options.spec = spec;
       options.suffix_draft = suffix_draft;
