@@ -60,6 +60,13 @@ Setup builds the SM120a server, verifies the model download and converts layers 
 
 The `32k`, `128k` and `256k` profiles are the exact recipes measured above. Every profile keeps all experts and the original model behaviour; placement only decides which experts live in VRAM.
 
+### Known limits
+
+- Layers 20 to 23 ship as MXFP8 and are converted to NVFP4. Quality checks so far compare against the converted model, not the original MXFP8 layers.
+- At 128K and 256K the KV cache is 4-bit (K4/V4) so the weights fit. Recall and reasoning at depth have only been checked on small fixtures (4 tasks per depth); use NInfer or a 32K/64K profile with FP8 KV for quality-critical long documents.
+- Headline decode is a coding task with DSpark drafting. Recall and tool runs are faster; open prose and chat have not been measured.
+- No multi-hour soak under a busy desktop yet. Free VRAM stays around 460 to 740 MiB, which is thin on Windows (WDDM).
+
 ### Images
 
 TWinkling is text-only by default, which keeps 0.6 GB of VRAM for experts. Set `TWINKLING_VISION=1` to load the image tower:
