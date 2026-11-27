@@ -43,7 +43,7 @@ One 16K decode round (a DSpark draft plus verify, about 2.8 accepted tokens) tak
 Linux x86-64 or Windows with WSL2 (tested on Ubuntu 26.04 under WSL2). You need a CUDA 13-capable NVIDIA driver, a C++20 compiler, Git and curl, plus about 40 GB of disk and system RAM for the download and conversion. The CUDA toolkit and model pack are pinned in [runtime-manifest.json](runtime-manifest.json).
 
 ```bash
-git clone https://github.com/fortun8te/TWinkling.git
+git clone https://github.com/fortun8te/TWinkling-2-Mini-RTX5080.git
 cd TWinkling
 bash scripts/setup-5080.sh
 TWINKLING_PROFILE=128k bash scripts/rtx5080/serve-5080.sh
