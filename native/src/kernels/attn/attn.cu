@@ -88,6 +88,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -105,6 +106,7 @@ constexpr int CS = 8;
 #include "kernels/attn/attn_impl.cuh"
 }  // namespace cs8
 #include "kernels/attn/splitk.cuh"
+#include "kernels/attn/ring_splitk.cuh"
 
 namespace {
 bool use16() {
@@ -122,14 +124,28 @@ int cluster_size() { return use16() ? 16 : 8; }
 
 std::size_t workspace_bytes(int max_m) {
     return std::max({cs16::workspace_bytes_impl(max_m), cs8::workspace_bytes_impl(max_m),
-                     splitk::workspace_bytes(max_m)});
+                     splitk::workspace_bytes(max_m), ring_splitk::workspace_bytes()});
 }
 
 int max_active_clusters(int M, int window) {
     return use16() ? cs16::max_active_clusters_impl(M, window) : cs8::max_active_clusters_impl(M, window);
 }
 
+// Opt-in (INGINE_RING_SPLITK=1): sliding layers through the split-K ring path. Measured time-neutral per verify
+// round in graph decode on the RTX 5080 (27 Nov 2026), so the cluster kernel stays the default.
+bool ring_splitk_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("INGINE_RING_SPLITK");
+        return e && std::string(e) == "1";
+    }();
+    return v;
+}
+
 void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
+    if (!use16() && a.window != 0 && !a.cache_fp8 && ring_splitk_on()) {
+        ring_splitk::attn_decode_ring(a, stream);
+        return;
+    }
     if (!use16() && a.window == 0 && a.cache_fp8) {
         splitk::attn_decode_splitk(a, stream);
         return;
