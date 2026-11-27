@@ -1,0 +1,17 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 760 158' width='760' height='158' font-family='-apple-system,Segoe UI,Helvetica,Arial,sans-serif'>
+<rect width='760' height='158' rx='14' fill='#141820'/>
+<text x='28' y='36' fill='#edf5fc' font-size='19' font-weight='650'>Where a 16K decode round goes</text>
+<text x='28' y='56' fill='#8fa1b5' font-size='13'>Nsight timeline, PDL-corrected. ~73% of the 893 GB/s byte ceiling.</text>
+<rect x='28.0' y='72' width='348.2' height='22' rx='4' fill='#7fc4ff'/>
+<rect x='28' y='109' width='9' height='9' rx='2' fill='#7fc4ff'/><text x='43' y='118' fill='#8fa1b5' font-size='12.5'>MoE experts <tspan fill='#edf5fc' font-weight='600'>49%</tspan></text>
+<rect x='378.2' y='72' width='140.9' height='22' rx='4' fill='#5c9fd6'/>
+<rect x='268' y='109' width='9' height='9' rx='2' fill='#5c9fd6'/><text x='283' y='118' fill='#8fa1b5' font-size='12.5'>Dense GEMV <tspan fill='#edf5fc' font-weight='600'>20%</tspan></text>
+<rect x='521.2' y='72' width='83.8' height='22' rx='4' fill='#4a7fae'/>
+<rect x='508' y='109' width='9' height='9' rx='2' fill='#4a7fae'/><text x='523' y='118' fill='#8fa1b5' font-size='12.5'>Glue kernels <tspan fill='#edf5fc' font-weight='600'>12%</tspan></text>
+<rect x='606.9' y='72' width='76.6' height='22' rx='4' fill='#3d6488'/>
+<rect x='28' y='129' width='9' height='9' rx='2' fill='#3d6488'/><text x='43' y='138' fill='#8fa1b5' font-size='12.5'>Ring attention <tspan fill='#edf5fc' font-weight='600'>11%</tspan></text>
+<rect x='685.5' y='72' width='26.6' height='22' rx='4' fill='#344c66'/>
+<rect x='268' y='129' width='9' height='9' rx='2' fill='#344c66'/><text x='283' y='138' fill='#8fa1b5' font-size='12.5'>Full attention <tspan fill='#edf5fc' font-weight='600'>4%</tspan></text>
+<rect x='714.1' y='72' width='15.9' height='22' rx='4' fill='#2d3d50'/>
+<rect x='508' y='129' width='9' height='9' rx='2' fill='#2d3d50'/><text x='523' y='138' fill='#8fa1b5' font-size='12.5'>DSpark drafter <tspan fill='#edf5fc' font-weight='600'>2.5%</tspan></text>
+</svg>

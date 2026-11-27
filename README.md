@@ -1,64 +1,97 @@
-# TWinkling · Inkling 2 Mini optimized for RTX 5080
+# TWinkling · Inkling 2 Mini on one RTX 5080
 
-**Inkling 2 Mini on one GeForce RTX 5080.** A C++/CUDA fork of [ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) for the 16 GB Blackwell card, with a local OpenAI-compatible server and a 64K text profile.
+**A C++/CUDA inference engine that runs Inkling 2 Mini with 256K context on a single 16 GB GeForce RTX 5080, at 250 W, with the official weights.**
 
-The port uses software barriers for SM120a, keeps selected experts in system RAM, and stages them in 256 MiB chunks during prefill. It converts four MXFP8 expert layers to NVFP4. The serving profile uses FP8 KV cache and DSpark.
+TWinkling is a fork of [ingine](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine), the custom engine built for one RTX 5090. The 5090 keeps the whole model in 32 GB. The 5080 has half that, so TWinkling was rebuilt around the smaller card: experts split between VRAM and pinned host RAM, a prefill path that streams the rest over PCIe while it computes, 4-bit KV cache for long context, and Blackwell SM120 kernels tuned for the 5080's 84 SMs and 12-SM GPCs.
 
-## Strata vs TWinkling on RTX 5080
+![Start of tuning vs now on the RTX 5080: decode up to 2.4x, first token up to 3.7x faster, load 2.8x faster](benchmarks/rtx5080/long-context/summary.svg)
 
-| Profile | Chat reply | Code reply |
-| --- | ---: | ---: |
-| Strata · SQ10, 32K | 145.7 tok/s | 173.0 tok/s |
-| TWinkling · NVFP4, 64K | 141.9 tok/s | 145.3 tok/s |
+| RTX 5080 · 250 W | Start | Now | Change |
+| --- | ---: | ---: | ---: |
+| Decode, 16K prompt | 139 tok/s | **290 tok/s** | **+109%** |
+| Decode, 128K prompt | 85 tok/s | **189 tok/s** | **+122%** |
+| Decode, 256K prompt | 57 tok/s | **138 tok/s** | **+142%** |
+| First token, 16K | 4.3 s | **1.43 s** | **−67%** |
+| First token, 128K | 75.3 s | **20.3 s** | **−73%** |
+| First token, 256K | 182.5 s | **68.1 s** | **−63%** |
+| Load to ready | 12.3 s | **4.4 s** | **−64%** |
 
-Median of three warm requests per workload. Same RTX 5080, same two prompts, 320 output tokens per reply, and a 250 W cap. Rates cover the whole request. The profiles use different quantizations and context sizes. [Raw measurements](benchmarks/rtx5080/strata-comparison.json)
+Same fixtures, seeds and flags in every column. Decode is streamed tok/s on a real coding task with the prompt already in context. First token is a cold prefill of the whole prompt. "Start" is TWinkling `2739a8e`. Every "now" run passed its task checks: 8/8 at 16K, 3/4 at 128K (the start build scored 2/4 on the same fixture), 4/4 code, tool and recall at 256K. [Data and method](benchmarks/rtx5080/long-context/results.json)
 
-## Run on an RTX 5080
+## Decode
 
-Use Linux x86-64 or Windows with WSL2. The checked Windows setup used Ubuntu 26.04 under WSL2. You need an NVIDIA CUDA 13-capable driver, a C++20 compiler, Git and curl. Reserve about 40 GB of disk and system RAM for the downloaded checkpoint and conversion. The CUDA toolkit and model pack are pinned in [runtime-manifest.json](runtime-manifest.json).
+![Decode tok/s at 16K, 128K and 256K for the start build, Phase 1 and now](benchmarks/rtx5080/long-context/decode.svg)
+
+Decode more than doubled at every depth. Most of it came in Phase 1: split-K attention that works without 16-CTA clusters (the 5080's GPCs hold 12 SMs), lossless VRAM reclaim so more experts fit on the card, and K4/V4 global KV so long contexts leave room for weights. Phase 2 left decode unchanged within noise (318 vs 290 tok/s at 16K spans the run-to-run spread).
+
+## Time to first token
+
+![Cold first-token seconds at 16K, 128K and 256K](benchmarks/rtx5080/long-context/first-token.svg)
+
+Phase 2 rebuilt prefill: FP8 tensor-core GEMMs for the dense layers, tensor-core attention, expert uploads overlapped with compute in staged chunks, and a 4-bit LM head path. A 128K prompt now starts answering in 20 seconds instead of 75.
+
+## How close to the hardware limit
+
+![Breakdown of one 16K decode round: MoE experts 49%, dense GEMV 20%, glue 12%, ring attention 11%, full attention 4%, DSpark 2.5%](benchmarks/rtx5080/long-context/decode-profile.svg)
+
+One 16K decode round (a DSpark draft plus verify, about 2.8 accepted tokens) takes 10.3 to 10.9 ms. Reading the bytes it needs at the 5080's measured 893 GB/s takes about 7.5 ms, so decode runs at roughly 73% of the memory-bandwidth ceiling. The expert and dense GEMVs already stream near the roofline. What remains is small-kernel latency, each piece worth 3 to 5% at most.
+
+## Run it
+
+Linux x86-64 or Windows with WSL2 (tested on Ubuntu 26.04 under WSL2). You need a CUDA 13-capable NVIDIA driver, a C++20 compiler, Git and curl, plus about 40 GB of disk and system RAM for the download and conversion. The CUDA toolkit and model pack are pinned in [runtime-manifest.json](runtime-manifest.json).
 
 ```bash
 git clone https://github.com/fortun8te/TWinkling.git
 cd TWinkling
 bash scripts/setup-5080.sh
-bash scripts/rtx5080/serve-5080.sh
+TWINKLING_PROFILE=128k bash scripts/rtx5080/serve-5080.sh
 ```
 
-Setup builds the SM120a server, verifies the upstream model download, and converts layers 20–23 with CPU PyTorch. The launcher uses the included [expert placement plan](config/rtx5080-experts.json). Keep the downloaded source checkpoint in place because the converted directory links to its unchanged files.
+Setup builds the SM120a server, verifies the model download and converts layers 20 to 23 to NVFP4 with CPU PyTorch. Keep the downloaded checkpoint in place: the converted directory links to its unchanged files.
 
-Check the local endpoint.
+| `TWINKLING_PROFILE` | Context | Expert placement | KV cache | Use it for |
+| --- | --- | --- | --- | --- |
+| `32k` | 32K | 12.4 GiB on GPU | FP8 K, 4-bit V, elastic | fastest chat and coding |
+| `64k` (default) | 64K | default plan | FP8 | general use |
+| `128k` | 128K | 11.2 GiB on GPU | 4-bit K and V | large repos and documents |
+| `256k` | 256K | 10.0 GiB on GPU | 4-bit K and V | whole codebases |
+
+The `32k`, `128k` and `256k` profiles are the exact recipes measured above. Every profile keeps all experts and the original model behaviour; placement only decides which experts live in VRAM.
 
 ```bash
-curl --fail http://127.0.0.1:18298/v1/models
 curl --fail http://127.0.0.1:18298/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"inkling-2-mini-abliterated","messages":[{"role":"user","content":"Reply with the number after 6."}],"max_tokens":32}'
 ```
 
-The launcher binds to loopback. Use `TWINKLING_PORT` or `TWINKLING_MODEL_DIR` to change the port or converted model directory. The 64K profile serves one generation at a time and queues subsequent requests.
+The server speaks the OpenAI API, binds to loopback and serves one generation at a time, queueing the rest. `TWINKLING_PORT`, `TWINKLING_MODEL_DIR`, `TWINKLING_CONTEXT`, `TWINKLING_PREFILL_CHUNK`, `TWINKLING_KV=fp8|v4|k4` and `TWINKLING_PARK_HOST_MIB` override the profile. Keep a conversation's prefix identical and append new turns to reuse its prefill checkpoint.
 
-## RTX 5080 benchmarks
+## What's inside
 
-On one 16 GB RTX 5080 at a 280 W power limit, the installed eight-block build delivered **180.1 tok/s on the chat fixture, 165.8 tok/s on the code fixture, and 4,162 tok/s on a 20K-token prompt**. The benchmark reported 15.26 GB of GPU allocation.
+- **SM120 kernels for 16 GB.** Software grid barriers instead of 16-CTA clusters, split-K attention sized for 84 SMs, CUDA Graphs with conditional nodes and programmatic dependent launch for decode.
+- **Tiered experts.** A calibrated plan keeps the most-routed experts in VRAM and the rest in pinned host RAM. Four MXFP8 expert layers are requantized to NVFP4.
+- **Streaming prefill.** Host experts upload in staged chunks while attention and dense GEMMs run, with FP8 tensor-core GEMMs and tensor-core attention.
+- **Compact KV.** FP8, FP8-K/4-bit-V and full K4/V4 global caches, with elastic paging at short context.
+- **DSpark speculative decoding** with batched verify on the target model.
 
-![RTX 5080 decode chart comparing eight-block control runs with the four-block sliding-attention candidate on chat and code](benchmarks/rtx5080/decode.png)
+## Tried and measured, off by default
 
-![RTX 5080 prefill chart showing roughly 4,160 input tokens per second across three variants on a 20,000-token prompt](benchmarks/rtx5080/prefill.png)
+Every lever below was built, checked against an FP64 or reference oracle, and A/B tested on the 5080. None beat the defaults on real tasks, so each stays behind a flag for anyone who wants to push further.
 
-The trial used short prompts for decode and a separate 20K-token prefill probe. The four-block candidate gained about 2% on the code fixture, with a different speculative acceptance rate. TWinkling retains the eight-block kernel. See the [setup, limits, and reproduction commands](benchmarks/rtx5080/README.md) and [individual measurements](benchmarks/rtx5080/measurements.json).
+| Experiment | Result | Flag |
+| --- | --- | --- |
+| DFlash2 block-diffusion drafter (ported from Frankengine) | 1.95 → 4.72 tokens per verify on copy-heavy replay, no gain on real coding tasks | `--dflash2 DIR` |
+| GSQ-RCO IQ3_S experts, whole model resident in 10.8 GB | Fits easily, but KL 0.040 vs NVFP4, top-1 agreement 90%, no decode gain | `INGINE_GGUF_EXPERTS=path` |
+| 4-bit (NVFP4) dense weights | KL 0.030, top-1 91.4%; quality cost outweighs a ~7% speed estimate | `INGINE_SIM_NVFP4_DENSE=1` |
+| Split-K ring attention | Passes the oracle, time-neutral per decode round | `INGINE_RING_SPLITK=1` |
+| 16K full expert residency, 8-CTA cluster gates, DSpark thresholds 0.7/0.9 | No gain, out of memory, or within noise | n/a |
 
-## Experimental long-context controls
+## Earlier 64K benchmarks
 
-The 5080 launcher defaults to the 64K FP8 profile. Select `TWINKLING_PROFILE=128k` or `TWINKLING_PROFILE=256k` to use the corresponding text-only placement recipe with the original model behavior and all experts retained. A 256K slot reserves capacity and processes the tokens actually sent. Keep a session's prefix identical and append new turns to reuse its checkpoint.
+At a 280 W limit, the 64K eight-block build reached 180.1 tok/s on the chat fixture, 165.8 tok/s on the code fixture and 4,162 tok/s prefill on a 20K-token prompt. Against Strata on the same 5080 at 250 W: 141.9 vs 145.7 tok/s on chat and 145.3 vs 173.0 tok/s on code, with different quantizations and context sizes. [64K details](benchmarks/rtx5080/README.md) · [Strata comparison](benchmarks/rtx5080/strata-comparison.json)
 
-The tuned 128K preset uses 4,096-row prefill chunks and about 8.65 GiB of GPU-resident experts. In the paired tests on a quiet 250 W RTX 5080, it reduced first-token time on a 32,758-token prompt from 17.3 s to 9.9 s. Both 124,999-token coding outputs passed the same six functional checks, with the tuned recipe finishing in 58.9 s versus 94.2 s. A near-full tool and exact recall workflow passed with 742 MiB of observed GPU headroom.
-
-The tuned 256K preset uses 4,096-row chunks and about 7.4 GiB of GPU-resident experts. The CUDA scratch reuse frees 216 MiB at the previous placement. At the higher placement, the matched 255,935-token coding task returned the same correct code in 178.6 s versus 203.7 s. Cached recall and a separate tool round trip passed, with 686 MiB of observed GPU headroom during the deep coding test.
-
-`TWINKLING_KV=v4` keeps FP8 global keys and compresses global values to INT4. `TWINKLING_PREFILL_CHUNK` supports up to 4,096 rows, trading scratch memory for fewer expert transfers. `TWINKLING_PREFILL_OVERLAP=1` overlaps those transfers with attention work. `TWINKLING_PARK_HOST_MIB` sets an optional pinned host-memory budget for restoring displaced conversations.
-
-Use [qualify_long.py](benchmarks/rtx5080/qualify_long.py) against an isolated loopback server to check actual prompt depth, exact recall, coding, and tool round-trips. Test the intended placement and cache precision together and check free VRAM during both load and generation.
+Use [qualify_long.py](benchmarks/rtx5080/qualify_long.py) against an isolated loopback server to check prompt depth, exact recall, coding and tool round-trips for your own placement and cache settings, and watch free VRAM during both load and generation. Charts regenerate from data with `python3 benchmarks/rtx5080/long-context/plot.py`.
 
 ## Source and license
 
-TWinkling keeps ingine’s Apache-2.0 engine and third-party notices. The RTX 5080 branch adds the SM120a port, expert placement and requantization, and staged prefill. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The full checkpoint is fetched from the upstream [model pack](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine). The base [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) model is by Thinking Machines Lab.
+TWinkling keeps ingine's Apache-2.0 engine and third-party notices. The DFlash2 drafter is adapted from [Frankengine](https://github.com/Alexintosh/Frankengine) (Apache-2.0) and the GGUF dot products from [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT). See [LICENSE](LICENSE) and [NOTICE](NOTICE). The checkpoint is fetched from the upstream [model pack](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine). The base [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) model is by Thinking Machines Lab.

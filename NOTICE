@@ -60,6 +60,17 @@ and license notices:
   Includes the original Public Software Group and subsequent contributor
   notices, along with the Unicode data notices reproduced in that file.
 
+TWinkling RTX 5080 additions
+----------------------------
+- DFlash2 drafter (native/src/model/dflash2.*, kernels/head/nvfp4_head.*,
+  kernels/draft/*, kernels/common/nvfp4.cuh, model/tp_layout.h) is ported
+  from Frankengine (https://github.com/Alexintosh/Frankengine), Apache
+  License 2.0, and adapted to a single GeForce RTX 5080.
+- GGUF expert kernels: native/src/kernels/moe/ggml-common.h and the dot
+  products in native/src/kernels/moe/gguf_dot.cuh are taken from llama.cpp
+  (ggml/src/ggml-common.h, ggml/src/ggml-cuda/vecdotq.cuh),
+  Copyright (c) 2023-2026 The ggml authors; MIT License.
+
 Model
 -----
 Inkling-2-Mini: https://huggingface.co/thinkingmachines/Inkling-2-Mini
