@@ -44,4 +44,7 @@ void head_nvfp4(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* logits, Can
 void head_nvfp4_raw(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* dots, Candidate* candidates,
                     Candidate* scratch, cudaStream_t stream);
 
+// Simulation helper: rounds BF16 rows in place through NVFP4 (per-16 E4M3 scales, one outer scale).
+void nvfp4_roundtrip_rows(__nv_bfloat16* w, int rows, int cols, cudaStream_t stream);
+
 }  // namespace ingine::kernels::head

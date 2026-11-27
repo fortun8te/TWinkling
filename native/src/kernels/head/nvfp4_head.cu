@@ -251,4 +251,40 @@ void head_nvfp4_raw(const __nv_bfloat16* x, int M, Nvfp4Matrix w, float* dots, C
   CUDA_CHECK(cudaGetLastError());
 }
 
+
+namespace {
+__device__ __forceinline__ float e2m1_round(float x) {
+    const float a = fabsf(x);
+    float r;
+    if (a <= 0.25f) r = 0.f;
+    else if (a < 0.75f) r = 0.5f;
+    else if (a <= 1.25f) r = 1.f;
+    else if (a < 1.75f) r = 1.5f;
+    else if (a <= 2.5f) r = 2.f;
+    else if (a < 3.5f) r = 3.f;
+    else if (a <= 5.f) r = 4.f;
+    else r = 6.f;
+    return x < 0.f ? -r : r;
+}
+// thread per 16-value block: value -> e2m1 * e4m3(block amax / 6 / outer) * outer, back to BF16 in place
+__global__ void roundtrip_kernel(__nv_bfloat16* w, size_t blocks, float outer) {
+    const size_t b = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    if (b >= blocks) return;
+    __nv_bfloat16* v = w + b * 16;
+    float m = 0.f;
+    for (int i = 0; i < 16; ++i) m = fmaxf(m, fabsf(__bfloat162float(v[i])));
+    const float sd = float(__nv_fp8_e4m3(m / 6.f / outer)) * outer;
+    for (int i = 0; i < 16; ++i)
+        v[i] = __float2bfloat16(sd > 0.f ? e2m1_round(__bfloat162float(v[i]) / sd) * sd : 0.f);
+}
+}  // namespace
+
+void nvfp4_roundtrip_rows(__nv_bfloat16* w, int rows, int cols, cudaStream_t stream) {
+    if (!w || rows <= 0 || cols % 16) throw std::invalid_argument("nvfp4_roundtrip_rows: bad shape");
+    const float outer = nvfp4_outer_scale(w, size_t(rows) * cols, stream);
+    const size_t blocks = size_t(rows) * cols / 16;
+    roundtrip_kernel<<<unsigned((blocks + 255) / 256), 256, 0, stream>>>(w, blocks, outer);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace ingine::kernels::head

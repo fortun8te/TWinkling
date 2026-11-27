@@ -19,6 +19,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -234,6 +235,12 @@ std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
 
 // FP8 rows + scales of a BF16 matrix (dense fp8_rows), into new storage.
 Dense to_fp8(Loader& ld, const Tensor& bf16, int rows, int cols) {
+  // INGINE_SIM_NVFP4_DENSE=1: quality screen for 4-bit dense weights (NVFP4 values carried in the FP8 path)
+  static const bool sim = [] {
+    const char* e = std::getenv("INGINE_SIM_NVFP4_DENSE");
+    return e && std::atoi(e) != 0;
+  }();
+  if (sim) kernels::head::nvfp4_roundtrip_rows(static_cast<__nv_bfloat16*>(bf16.data), rows, cols, ld.stream());
   void* q = ld.alloc(std::size_t(rows) * cols);
   float* s = static_cast<float*>(ld.alloc(std::size_t(rows) * 4));
   kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(bf16.data), rows, cols, q, s, ld.stream());
