@@ -495,6 +495,22 @@ int main(int argc, char** argv) {
       ok &= run(rng, c);
     }
   }
+  // FP8 sliding-window (ring) caches; last, so the earlier fixtures keep their random draws.
+  for (const char* kind : {"empty", "partial", "wrapped", "stale"})
+    for (int M : {1, 3, 8}) {
+      Case c;
+      c.full = false, c.fp8 = true, c.M = M;
+      c.kpos = ring(kind, c.p0);
+      c.name = std::string("sliding fp8 ") + kind + " M=" + std::to_string(M);
+      ok &= run(rng, c);
+    }
+  for (int M : {2, 4, 5, 6, 7}) {
+    Case c;
+    c.full = false, c.fp8 = true, c.M = M;
+    c.kpos = ring("stale", c.p0);
+    c.name = "sliding fp8 stale M=" + std::to_string(M);
+    ok &= run(rng, c);
+  }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

@@ -177,6 +177,13 @@ std::vector<T> host_t(const Tensor& t, cudaStream_t s) {
   return h;
 }
 
+std::vector<std::uint8_t> host_bytes(const Tensor& t, cudaStream_t s) {
+  std::vector<std::uint8_t> h(t.bytes());
+  INGINE_TEST_CUDA(cudaMemcpyAsync(h.data(), t.data, h.size(), cudaMemcpyDeviceToHost, s));
+  INGINE_TEST_CUDA(cudaStreamSynchronize(s));
+  return h;
+}
+
 // row `row` of width-m logits ([m, vocabulary rows] buffer, kVocab columns used)
 std::vector<float> logits_row(Runtime& rt, int m, int row) {
   const std::size_t stride = std::size_t(rt.weights().unembed.rows());
@@ -204,7 +211,7 @@ bool report(bool ok, const std::string& what) {
 struct StateCopy {
   std::vector<float> conv_k, conv_v, conv_attn, conv_mlp;
   std::vector<std::int64_t> ring_pos;
-  std::vector<std::uint16_t> k_ring, v_ring;
+  std::vector<std::uint8_t> k_ring, v_ring;
   bool operator==(const StateCopy&) const = default;
 };
 
@@ -212,8 +219,8 @@ StateCopy copy_state(Runtime& rt) {
   const State& st = rt.state();
   const cudaStream_t s = rt.stream();
   return {host_t<float>(st.conv_k, s),         host_t<float>(st.conv_v, s),         host_t<float>(st.conv_attn, s),
-          host_t<float>(st.conv_mlp, s),       host_t<std::int64_t>(st.ring_pos, s), host_t<std::uint16_t>(st.k_ring, s),
-          host_t<std::uint16_t>(st.v_ring, s)};
+          host_t<float>(st.conv_mlp, s),       host_t<std::int64_t>(st.ring_pos, s), host_bytes(st.k_ring, s),
+          host_bytes(st.v_ring, s)};
 }
 
 // all m rows of width-m logits (kVocab columns each)

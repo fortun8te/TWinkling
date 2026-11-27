@@ -55,6 +55,11 @@ class Prefiller {
   // weights, sum of weight * ||expert output||} to stats (device fp32 [48, 128, 3]). nullptr: off.
   void set_stats(float* stats) { stats_ = stats; }
   std::size_t device_bytes() const;  // scratch held by this object
+  // Contiguous scratch arena (idle between Prefiller::run() calls; lent to decode for cold-expert caching).
+  void* lend_arena() const { return arena_.p; }
+  std::size_t lend_arena_bytes() const { return arena_.bytes; }
+  // Ensure the async expert-staging stream waits for `s` before writing into `stage_` on the next run().
+  void sync_transfer_after_stream(cudaStream_t s);
 
  private:
   const float* const* block_table(const std::vector<const float*>& blocks);
@@ -64,7 +69,8 @@ class Prefiller {
   int max_chunk_;
   cudaStream_t stream_;
   std::unique_ptr<kernels::prefill::Gemm> gemm_;
-  std::vector<DeviceBuffer> storage_;
+  DeviceBuffer arena_;  // contiguous per-chunk scratch + stage_ (idle during decode)
+  std::vector<DeviceBuffer> storage_;  // persistent zero-padded buffers (krows_, vrows_, kpos_, bounds_)
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
 
   // activations (rows = max_chunk), see prefill.cpp
@@ -88,7 +94,8 @@ class Prefiller {
   std::int64_t* ids_;
   int kpos_rows_;
   float* stats_ = nullptr;
-  DeviceBuffer stage_;
+  void* stage_ptr_ = nullptr;
+  std::size_t stage_bytes_ = 0;
   DeviceBuffer gguf_nv_;  // GGUF expert mode: one layer's experts transcoded to NVFP4 per visit
   int stage_slots_ = 1;
   struct ExpertTransfer;

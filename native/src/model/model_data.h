@@ -136,6 +136,7 @@ struct Experts {
   //        w2_scale u8 [128, 2304, 36], factors empty
   Tensor w13, w13_scale, w2, w2_scale;
   Tensor w13_factor, w2_factor;
+  int w13_scale_base = -1, w2_scale_base = -1;  // >= 0: 6-bit packed NVFP4 E4M3 scales with this base code
   // GGUF mode (INGINE_GGUF_EXPERTS): every routed expert resident as GGUF blocks in checkpoint order; w13 etc.
   // above are empty and the prefill transcodes these to NVFP4 per visit.
   const void* g13 = nullptr;  // ffn_gate_up_exps [128, 2304 (gate | up), 2304]
@@ -235,8 +236,8 @@ struct Ablation {
 // model.State: per-request caches.
 struct State {
   int max_ctx = 0;
-  bool kv_fp8 = false, kv_v4 = false, kv_k4 = false;
-  Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
+  bool kv_fp8 = false, ring_fp8 = false, kv_v4 = false, kv_k4 = false;
+  Tensor k_ring, v_ring;      // [40, 1024, 8, 128] bf16 or fp8 e4m3 (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
   Tensor k_full, v_full;      // global caches [8, max_ctx, 8, bytes or elements per head]
   Tensor conv_k, conv_v;      // fp32 [48, 3, 1024] previous 3 key/value conv inputs (oldest first)

@@ -25,7 +25,7 @@ constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * CS * GQA * M *
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
 // dynamic shared memory layout (floats), per M
-template <int M, bool F8 = false, bool V4 = false>
+template <int M, bool FULL = true, bool F8 = false, bool V4 = false>
 struct Smem {
     static constexpr int ROWS = GQA * M;
     // staged inputs (dead once the main loop starts)
@@ -47,16 +47,17 @@ struct Smem {
     // M > 1: K/V tiles loaded by the whole block (own region, so the first tiles are in flight while q /
     // rel and the owner's convolutions are computed); 16-byte chunks are XOR-swizzled by key.
     // BF16 caches: double-buffered 16-bit stages [2][KT][2][D], K rows bf16, V rows converted to fp16
-    // in place. E4M3 caches (full layers): two raw tiles [2][K: KT][D] + [V: KT][D] bytes (K chunks
-    // swizzled; K is read straight from them), V widened to fp16 in the staging region.
-    static constexpr int KT = F8 ? 64 : 32;              // keys per tile
+    // in place. E4M3 caches: two raw tiles [2][K: KT][D] + [V: KT][D] bytes (K chunks swizzled; K is
+    // read straight from them), V widened to fp16 in the staging region.
+    static constexpr int KT = (F8 && FULL) ? 64 : 32;    // keys per tile
+    static constexpr bool HAS_SRP = !FULL || !F8;        // kpos + rel_proj window for sliding (or BF16)
     // Keep packed V rows 16-byte aligned for the asynchronous copies. The fifth chunk holds the scale.
     static constexpr int RAW_V_STRIDE = V4 ? ((value4::kPackedBytes + sizeof(float) + 15) & ~15) : D;
     static constexpr int RAW_TILE_BYTES = KT * (D + RAW_V_STRIDE);
     static constexpr int KVS = (UNION_END + 3) & ~3;
     static constexpr int KPS = KVS + (M > 1 ? (F8 ? 2 * RAW_TILE_BYTES / 4 : 2 * KT * D) : 0);  // kpos [2][KT]
-    static constexpr int SRP = KPS + (M > 1 && !F8 ? 2 * KT : 0);      // rel_proj window [2][DREL][KT + MAXM]
-    static constexpr int TILE_END = SRP + (M > 1 && !F8 ? 2 * DREL * (KT + MAXM) : 0);
+    static constexpr int SRP = KPS + (M > 1 && HAS_SRP ? 2 * KT : 0);     // rel_proj window [2][DREL][KT + MAXM]
+    static constexpr int TILE_END = SRP + (M > 1 && HAS_SRP ? 2 * DREL * (KT + MAXM) : 0);
     // dedicated regions
     static constexpr int GATE = (TILE_END + 3) & ~3;     // this block's output gates [ROWS][OD]
     static constexpr int SINK = GATE + ROWS * OD;        // [ROWS]
@@ -67,11 +68,12 @@ struct Smem {
     static constexpr int NRP = M > 1 ? (ROWS + 7) / 8 * 8 : 0;
     static constexpr int QB = NST + 3 * 2 * D;           // q bf16 [NRP][D] (swizzled; as floats NRP D / 2)
     static constexpr int RELD = QB + NRP * D / 2;        // rel fp32 [NRP][16]
-    static constexpr int PSTRIDE = KT + 8;               // fp16 per P row (80 B: conflict-free ldmatrix)
+    static constexpr int PSTRIDE = KT + 8;               // fp16 per P row (80 B / 48 B: conflict-free ldmatrix)
     static constexpr int PS = RELD + NRP * DREL;         // P as fp16 hi, lo [2][NRP][PSTRIDE]
     static constexpr int ITM = PS + NRP * PSTRIDE;       // per key m-tile row (max, sum) float2 [KT/16][NRP]
     static constexpr int END = ITM + 2 * (KT / 16) * NRP;
     static constexpr size_t BYTES = size_t(END) * 4;
+    static_assert(BYTES <= 101376, "Smem exceeds dynamic shared memory limit");
 };
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return unsigned(__cvta_generic_to_shared(p)); }
@@ -282,12 +284,12 @@ struct Buf {
 
 template <int M, bool FULL, bool F8, bool V4>
 __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
-    static_assert((FULL || !F8) && (!V4 || F8), "invalid full-layer cache precision");
+    static_assert(!V4 || (FULL && F8), "invalid cache precision");
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
     using CacheBuf = Buf<KV, std::conditional_t<V4, value4::Slice, KV>>;
     constexpr int KW = 8, ROWS = GQA * M;  // KW: key-slice warps of the M = 1 path
-    using L = Smem<M, F8, V4>;
+    using L = Smem<M, FULL, F8, V4>;
     extern __shared__ __align__(16) float sm[];
     __nv_bfloat16(*s_nkv)[M][D] = reinterpret_cast<__nv_bfloat16(*)[M][D]>(sm + L::NKV);
 
@@ -430,6 +432,20 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 cp16z(reinterpret_cast<float*>(dst),
                       reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok,
                       kvpol);
+            }
+            if constexpr (!FULL) {
+                const int st = t % NRAW;
+                for (int i = tid; i < KT; i += NT)
+                    cp4z(reinterpret_cast<float*>(kps + st * KT + i),
+                         reinterpret_cast<const float*>(p.kpos + (base + i < L_old ? base + i : 0)), base + i < L_old);
+                const int dbase = dbase_of(base);
+                if (dbase < EXT) {
+                    for (int i = tid; i < DREL * NE; i += NT) {
+                        const int c2 = i / NE, e = i % NE, d = dbase + e;
+                        const bool ok = d >= 0 && d < EXT;
+                        cp4z(srp + (st * DREL + c2) * (KT + MAXM) + e, p.rel_proj + c2 * EXT + (ok ? d : 0), ok);
+                    }
+                }
             }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
@@ -918,7 +934,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 const int nn = nn0 + jt * nstep, r0 = nn * 8 + 2 * t4;
                 if (nn >= NTN) break;
                 const int dbase = dbase_of(base);
-                const bool staged = !F8 && !is_new && dbase < EXT;  // E4M3 tiles stage no rel_proj window
+                const bool staged = (!F8 || !FULL) && !is_new && dbase < EXT;
                 float sv[4];
 #pragma unroll
                 for (int v = 0; v < 4; ++v) {  // (key gid | gid + 8, row 2 t4 | 2 t4 + 1)
@@ -1021,7 +1037,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         using RawK = std::true_type;
         using SmemK = std::false_type;
 
-        // the call's own keys first (stage 1 of kvs; for E4M3 caches V rows 0..15 and K rows 32..47 of wv),
+        // the call's own keys first (stage 1 of kvs; for E4M3 caches V rows 0..15 and K rows OWN_K.. of wv:
+        // 32 on full layers as before, 16 on sliding layers whose 32-key tile is only 32 rows),
+        constexpr int OWN_K = FULL ? 32 : 16;
         // while the first tiles are in flight
         if (owner) {
             for (int i = tid; i < 16 * 2 * (D / 8); i += NT) {
@@ -1029,13 +1047,13 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 uint4 u = make_uint4(0u, 0u, 0u, 0u);
                 if (key < M) u = reinterpret_cast<const uint4*>(&s_nkv[kv][key][0])[ch];
                 if (kv) u = make_uint4(to_half(u.x), to_half(u.y), to_half(u.z), to_half(u.w));
-                uint4* dst = F8 ? reinterpret_cast<uint4*>(wv + (kv ? 0 : 32 * D) + roff(key, ch))
+                uint4* dst = F8 ? reinterpret_cast<uint4*>(wv + (kv ? 0 : OWN_K * D) + roff(key, ch))
                                 : reinterpret_cast<uint4*>(kvs + kv_off(1, key, kv, ch));
                 *dst = u;
             }
             __syncthreads();
             if constexpr (F8)
-                consume([&](int key, int ch) { return reinterpret_cast<const __nv_bfloat16*>(wv + 32 * D + roff(key, ch)); },
+                consume([&](int key, int ch) { return reinterpret_cast<const __nv_bfloat16*>(wv + OWN_K * D + roff(key, ch)); },
                         [&](int key, int ch) { return wv + roff(key, ch); }, SmemK{}, nullptr, 0, 0, true, nothing);
             else
                 consume([&](int key, int ch) { return kvs + kv_off(1, key, 0, ch); },
@@ -1049,8 +1067,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                 expand_v(t % NRAW);
                 __syncthreads();
                 consume([&](int key, int ch) { return kvs + kv_off(0, key, 0, ch); },  // (unused: K is raw)
-                        [&](int key, int ch) { return wv + roff(key, ch); }, RawK{}, raw + (t % NRAW) * RAWB, 0, base,
-                        false, [&] { issue_raw(t + NRAW); });  // after the S items, this tile's slot is free
+                        [&](int key, int ch) { return wv + roff(key, ch); }, RawK{}, raw + (t % NRAW) * RAWB,
+                        t % NRAW, base, false, [&] { issue_raw(t + NRAW); });  // after the S items, this tile's slot is free
             }
         } else {
             int st = 0;
@@ -1165,8 +1183,9 @@ Kernel kernel_of() {
     static const Kernel k = [] {
         const KernelFn f = attn_decode_kernel<M, FULL, F8, V4>;
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8, V4>::BYTES)));
-        return Kernel{f, M, Smem<M, F8, V4>::BYTES};
+        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        int(Smem<M, FULL, F8, V4>::BYTES)));
+        return Kernel{f, M, Smem<M, FULL, F8, V4>::BYTES};
     }();
     return k;
 }
@@ -1230,7 +1249,6 @@ void attn_decode_impl(const DecodeArgs& a, cudaStream_t stream) {
                 a.conv_v_state && a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
             "null argument");
     require(!a.cache_v4 || (full && a.cache_fp8), "INT4 values require FP8 keys on a full visit");
-    require(full || !a.cache_fp8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
     if (!full) {
@@ -1259,7 +1277,8 @@ void attn_decode_impl(const DecodeArgs& a, cudaStream_t stream) {
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
     const Kernel k = a.cache_v4 ? select<true, true, true>(M)
-                                     : full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
+                                     : full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M))
+                                            : (a.cache_fp8 ? select<false, true>(M) : select<false>(M));
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));

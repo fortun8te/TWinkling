@@ -444,8 +444,9 @@ void Drafter::restore_checkpoint(const void* src) {
   if (!prefix) note_tokens(checkpoint_extra_);
 }
 
-void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece) {
+void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool do_local, bool do_global, bool do_frnn) {
   for (int l = 0; l < 3; ++l) {
+    if (is_local(l) ? !do_local : !do_global) continue;
     const DraftLayer& L = layers_[l];
     kd::mix_rmsnorm(feats, n, alpha_ + 4 * l, L.ctx_norm, ctx_c_, stream_);
     kernels::prefill::quantize_mxfp8(ctx_c_, n, H, ctx_xq_, ctx_xs_, stream_);
@@ -458,26 +459,46 @@ void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_
     kd::ctx_kv_store(ctx_kv_, n, params_, row0, n - std::min(n, size), L.k_norm_ctx, L.k_ctx, L.v_ctx,
                      !is_local(l) && GLOBAL_FP8, size, L.ctx_pos, stream_);
   }
-  if (last_piece) kd::mix_rmsnorm(feats + std::size_t(n - 1) * 4 * H, 1, alpha_ + 12, f_norm_, f_rnn_, stream_);
+  if (do_frnn) kd::mix_rmsnorm(feats + std::size_t(n - 1) * 4 * H, 1, alpha_ + 12, f_norm_, f_rnn_, stream_);
 }
 
-void Drafter::commit(const Tensor& feats, int start) {
+void Drafter::commit(const Tensor& feats, int start, int prompt_end) {
   if (feats.dtype != DType::BF16 || feats.ne[0] != H || feats.ne[1] != 4 || !feats.is_contiguous())
     throw std::invalid_argument("Drafter::commit: feats must be contiguous bf16 [n, 4, 2304]");
-  commit(static_cast<const __nv_bfloat16*>(feats.data), feats.ne[2] * feats.ne[3], start);
+  commit(static_cast<const __nv_bfloat16*>(feats.data), feats.ne[2] * feats.ne[3], start, prompt_end);
 }
 
-void Drafter::commit(const __nv_bfloat16* feats, int n, int start) {
+void Drafter::commit(const __nv_bfloat16* feats, int n, int start, int prompt_end) {
   if (n <= 0) return;
+  if (prompt_end < 0) prompt_end = start + n;
+  const int chunk_end = start + n;
+  const bool do_local_any = chunk_end > prompt_end - kd::WINDOW;
+  const bool do_global_any = chunk_end > prompt_end - ctx_;
+  const bool do_frnn_any = chunk_end == prompt_end;
+  if (!do_local_any && !do_global_any && !do_frnn_any) {
+    global_written(start, chunk_end);
+    length_ = chunk_end;
+    return;
+  }
+  if (!feats) throw std::invalid_argument("Drafter::commit: null feats for active chunk");
   if (n <= BLOCK) {
     kd::set_commit(params_, feats, n, start, stream_);
     if (commit_graph_) CUDA_CHECK(cudaGraphLaunch(commit_graph_, stream_));
     else run_small_commit();
   } else {
-    kd::set_commit_start(params_, start, stream_);
+    bool started = false;
     for (int r0 = 0; r0 < n; r0 += COMMIT_PIECE) {
       const int k = std::min(COMMIT_PIECE, n - r0);
-      run_commit(feats + std::size_t(r0) * 4 * H, k, r0, r0 + k == n);
+      const int piece_end = start + r0 + k;
+      const bool do_local = piece_end > prompt_end - kd::WINDOW;
+      const bool do_global = piece_end > prompt_end - ctx_;
+      const bool do_frnn = piece_end == prompt_end;
+      if (!do_local && !do_global && !do_frnn) continue;
+      if (!started) {
+        kd::set_commit_start(params_, start, stream_);
+        started = true;
+      }
+      run_commit(feats + std::size_t(r0) * 4 * H, k, r0, do_local, do_global, do_frnn);
     }
   }
   global_written(start, start + n);

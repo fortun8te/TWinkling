@@ -236,6 +236,51 @@ bool test_gates(Rng& rng, int T) {
   return ok;
 }
 
+bool test_gate_down_fused(Rng& rng, int G, int T) {
+  std::vector<std::vector<float>> h(G), m(G);
+  for (int g = 0; g < G; ++g) h[g] = rand_f32(rng, size_t(T) * H, 2.0), m[g] = rand_f32(rng, size_t(T) * H, 0.5);
+  std::vector<DeviceArray<float>> dh, dm;
+  pk::GateRows rows;
+  for (int g = 0; g < G; ++g) {
+    dh.emplace_back(h[g]), dm.emplace_back(m[g]);
+    rows.h[g] = dh.back().get(), rows.msg[g] = dm.back().get();
+  }
+  const int rank = 64;
+  const auto down = rand_bf16(rng, size_t(G) * rank * 2 * H, 0.05);
+  DeviceArray<uint16_t> d_down(down), d_out(size_t(G) * T * rank);
+  pk::gate_down_fused(rows, G, T, reinterpret_cast<const __nv_bfloat16*>(d_down.get()),
+                      reinterpret_cast<__nv_bfloat16*>(d_out.get()), nullptr);
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  const auto go = d_out.download();
+  std::vector<float> got;
+  std::vector<double> ref;
+  got.reserve(size_t(G) * T * rank);
+  ref.reserve(size_t(G) * T * rank);
+  for (int g = 0; g < G; ++g) {
+    for (int t = 0; t < T; ++t) {
+      double sh = 0, sm = 0;
+      for (int c = 0; c < H; ++c) {
+        const double hv = h[g][size_t(t) * H + c], mv = m[g][size_t(t) * H + c];
+        sh += hv * hv, sm += mv * mv;
+      }
+      const double rh = 1.0 / std::sqrt(sh / H + 1e-6), rm = 1.0 / std::sqrt(sm / H + 1e-6);
+      for (int r = 0; r < rank; ++r) {
+        const uint16_t* wr = &down[(size_t(g) * rank + r) * 2 * H];
+        double acc = 0;
+        for (int c = 0; c < H; ++c) {
+          acc += double(rbf(h[g][size_t(t) * H + c] * rh)) * bf16_val(wr[c]);
+          acc += double(rbf(m[g][size_t(t) * H + c] * rm)) * bf16_val(wr[H + c]);
+        }
+        ref.push_back(acc);
+        got.push_back(bf16_val(go[(size_t(g) * T + t) * rank + r]));
+      }
+    }
+  }
+  char name[48];
+  std::snprintf(name, sizeof name, "gate_down_fused G=%d T=%d", G, T);
+  return check_close(name, got, ref, 4e-3, 1e-3);
+}
+
 bool test_head(Rng& rng, bool fp8) {
   const int V = 3001;
   const auto x = rand_bf16(rng, H, 1.0);
@@ -356,6 +401,9 @@ int main() {
   ok &= test_conv(rng, 2);
   ok &= test_conv(rng, 37);
   ok &= test_gates(rng, 5);
+  ok &= test_gate_down_fused(rng, 3, 5);
+  ok &= test_gate_down_fused(rng, 3, 37);
+  ok &= test_gate_down_fused(rng, 1, 128);
   ok &= test_head(rng, false);
   ok &= test_head(rng, true);
   ok &= test_gemm(rng);

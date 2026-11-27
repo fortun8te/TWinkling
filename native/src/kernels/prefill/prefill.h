@@ -59,11 +59,15 @@ void gemm_fp8_batch(const Fp8GemmProduct* products, int count, int m, int k, cud
 // rows -1); attn_prep writes the chunk rows.
 void ring_gather(const __nv_bfloat16* k_ring, const __nv_bfloat16* v_ring, const int64_t* ring_pos, int pos0, int T,
                  __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream);
+void ring_gather(const void* k_ring, const void* v_ring, const int64_t* ring_pos, int pos0, int T, void* k_rows,
+                 void* v_rows, int* kpos, int kpos_rows, bool fp8, cudaStream_t stream);
 
 // model.prefill's ring update: the last min(T, 1024) chunk rows (rows 1024.. of k_rows/v_rows) into their slots
 // (pos % 1024), ring_pos = pos.
 void ring_update(const __nv_bfloat16* k_rows, const __nv_bfloat16* v_rows, int pos0, int T, __nv_bfloat16* k_ring,
                  __nv_bfloat16* v_ring, int64_t* ring_pos, cudaStream_t stream);
+void ring_update(const void* k_rows, const void* v_rows, int pos0, int T, void* k_ring, void* v_ring,
+                 int64_t* ring_pos, bool fp8, cudaStream_t stream);
 
 // Per key tile of kAttnKeyTile rows: int4 {min valid position, max valid position, all rows valid, any valid}.
 void key_tile_bounds(const int* kpos, int L, int4* bounds, cudaStream_t stream);
@@ -136,6 +140,9 @@ struct GateRows {
   const float* msg[3] = {};
 };
 void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream);
+// Fused gate_inputs + down_proj GEMM: out [G, T, 64] = bf16(norm(h[g]), norm(msg[g])) * down[g]^T.
+void gate_down_fused(const GateRows& rows, int G, int T, const __nv_bfloat16* down, __nv_bfloat16* out,
+                     cudaStream_t stream);
 
 // out[t] = bf16(rms_norm((1 - tanh(f)) * h + tanh(g) * msg) * norm_w); f, g fp32 [T, H] (the forget / gain
 // products of the BF16 down projection).
@@ -176,13 +183,20 @@ struct MoeExperts {
   // memory for this visit), expert stage_first + j at index j of the stage_* arrays (same layouts).
   int stage_first = 0, stage_n = 0;
   const void *stage_w13 = nullptr, *stage_w13_scale = nullptr, *stage_w2 = nullptr, *stage_w2_scale = nullptr;
+  int w13_scale_base = -1, w2_scale_base = -1;  // >= 0: 6-bit packed NVFP4 E4M3 scales with this base code
 };
+inline constexpr float kFusedActOuter = 1.f / 16.f;
 // Scratch for SM120a NVFP4 W4A4 activation quantization (Four-Over-Six).
 struct MoeQuantScratch {
-  uint8_t* xq = nullptr;     // [rows, K/2] E2M1 packed
-  uint8_t* xscale = nullptr; // [rows, K/16] E4M3 block scales
-  float* xouter = nullptr;   // [rows] FP32 outer scales
+  uint8_t* xq = nullptr;         // [rows, K/2] E2M1 packed
+  uint8_t* xscale = nullptr;     // [rows, K/16] E4M3 block scales
+  float* xouter = nullptr;       // [rows] FP32 outer scales (null when xouter_const > 0)
+  float xouter_const = 0.f;      // constant outer scale when prequantized
+  bool prequantized = false;     // input already quantized in xq/xscale
+  uint8_t* out_xq = nullptr;     // optional fused output codes [T * 8, kInter / 2] for moe_gate_up
+  uint8_t* out_xscale = nullptr; // optional fused output scales [T * 8, kInter / 16] for moe_gate_up
 };
+bool moe_fused_actq_active(int fmt, int T);
 // act[pair] = bf16(softcap(g, 4) * sigmoid(g) * softcap(u, 25)), g/u = bf16(W13_e . x[token]) (experts decoded
 // exactly as model.decode_experts, or native SM120a NVFP4 W4A4 when qscratch != nullptr).
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,

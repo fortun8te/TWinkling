@@ -3,38 +3,38 @@
 <text x='28' y='36' fill='#edf5fc' font-size='19' font-weight='650'>RTX 5080, start of tuning vs now</text>
 <text x='28' y='56' fill='#8fa1b5' font-size='13'>250 W, official weights, same fixtures. Bar length is the improvement factor.</text>
 <text x='28' y='91' fill='#edf5fc' font-size='13.5'>Decode 16K</text>
-<text x='300' y='91' fill='#8fa1b5' font-size='13' text-anchor='end'>139 → <tspan fill='#edf5fc' font-weight='650'>290</tspan> tok/s</text>
+<text x='300' y='91' fill='#8fa1b5' font-size='13' text-anchor='end'>139 → <tspan fill='#edf5fc' font-weight='650'>294</tspan> tok/s</text>
 <rect x='320' y='80' width='300' height='12' rx='6' fill='#2b3542'/>
-<rect x='320' y='80' width='156.5' height='12' rx='6' fill='#7fc4ff'/>
-<text x='732' y='91' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>+109% · 2.1×</text>
+<rect x='320' y='80' width='158.6' height='12' rx='6' fill='#7fc4ff'/>
+<text x='732' y='91' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>+112% · 2.1×</text>
 <text x='28' y='125' fill='#edf5fc' font-size='13.5'>Decode 128K</text>
-<text x='300' y='125' fill='#8fa1b5' font-size='13' text-anchor='end'>85 → <tspan fill='#edf5fc' font-weight='650'>189</tspan> tok/s</text>
+<text x='300' y='125' fill='#8fa1b5' font-size='13' text-anchor='end'>85 → <tspan fill='#edf5fc' font-weight='650'>208</tspan> tok/s</text>
 <rect x='320' y='114' width='300' height='12' rx='6' fill='#2b3542'/>
-<rect x='320' y='114' width='166.8' height='12' rx='6' fill='#7fc4ff'/>
-<text x='732' y='125' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>+122% · 2.2×</text>
+<rect x='320' y='114' width='183.5' height='12' rx='6' fill='#7fc4ff'/>
+<text x='732' y='125' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>+145% · 2.4×</text>
 <text x='28' y='159' fill='#edf5fc' font-size='13.5'>Decode 256K</text>
-<text x='300' y='159' fill='#8fa1b5' font-size='13' text-anchor='end'>57 → <tspan fill='#edf5fc' font-weight='650'>138</tspan> tok/s</text>
+<text x='300' y='159' fill='#8fa1b5' font-size='13' text-anchor='end'>57 → <tspan fill='#edf5fc' font-weight='650'>141</tspan> tok/s</text>
 <rect x='320' y='148' width='300' height='12' rx='6' fill='#2b3542'/>
-<rect x='320' y='148' width='181.6' height='12' rx='6' fill='#7fc4ff'/>
-<text x='732' y='159' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>+142% · 2.4×</text>
+<rect x='320' y='148' width='185.5' height='12' rx='6' fill='#7fc4ff'/>
+<text x='732' y='159' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>+147% · 2.5×</text>
 <text x='28' y='193' fill='#edf5fc' font-size='13.5'>First token 16K</text>
 <text x='300' y='193' fill='#8fa1b5' font-size='13' text-anchor='end'>4.3 → <tspan fill='#edf5fc' font-weight='650'>1.43</tspan> s</text>
 <rect x='320' y='182' width='300' height='12' rx='6' fill='#2b3542'/>
 <rect x='320' y='182' width='225.5' height='12' rx='6' fill='#7fc4ff'/>
 <text x='732' y='193' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>-67% · 3.0×</text>
 <text x='28' y='227' fill='#edf5fc' font-size='13.5'>First token 128K</text>
-<text x='300' y='227' fill='#8fa1b5' font-size='13' text-anchor='end'>75.3 → <tspan fill='#edf5fc' font-weight='650'>20.3</tspan> s</text>
+<text x='300' y='227' fill='#8fa1b5' font-size='13' text-anchor='end'>75.3 → <tspan fill='#edf5fc' font-weight='650'>19.9</tspan> s</text>
 <rect x='320' y='216' width='300' height='12' rx='6' fill='#2b3542'/>
-<rect x='320' y='216' width='278.2' height='12' rx='6' fill='#7fc4ff'/>
-<text x='732' y='227' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>-73% · 3.7×</text>
+<rect x='320' y='216' width='283.8' height='12' rx='6' fill='#7fc4ff'/>
+<text x='732' y='227' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>-74% · 3.8×</text>
 <text x='28' y='261' fill='#edf5fc' font-size='13.5'>First token 256K</text>
-<text x='300' y='261' fill='#8fa1b5' font-size='13' text-anchor='end'>182.5 → <tspan fill='#edf5fc' font-weight='650'>68.1</tspan> s</text>
+<text x='300' y='261' fill='#8fa1b5' font-size='13' text-anchor='end'>182.5 → <tspan fill='#edf5fc' font-weight='650'>60.7</tspan> s</text>
 <rect x='320' y='250' width='300' height='12' rx='6' fill='#2b3542'/>
-<rect x='320' y='250' width='201.0' height='12' rx='6' fill='#7fc4ff'/>
-<text x='732' y='261' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>-63% · 2.7×</text>
+<rect x='320' y='250' width='225.5' height='12' rx='6' fill='#7fc4ff'/>
+<text x='732' y='261' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>-67% · 3.0×</text>
 <text x='28' y='295' fill='#edf5fc' font-size='13.5'>Load to ready</text>
-<text x='300' y='295' fill='#8fa1b5' font-size='13' text-anchor='end'>12.3 → <tspan fill='#edf5fc' font-weight='650'>4.4</tspan> s</text>
+<text x='300' y='295' fill='#8fa1b5' font-size='13' text-anchor='end'>12.3 → <tspan fill='#edf5fc' font-weight='650'>3.9</tspan> s</text>
 <rect x='320' y='284' width='300' height='12' rx='6' fill='#2b3542'/>
-<rect x='320' y='284' width='209.7' height='12' rx='6' fill='#7fc4ff'/>
-<text x='732' y='295' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>-64% · 2.8×</text>
+<rect x='320' y='284' width='236.5' height='12' rx='6' fill='#7fc4ff'/>
+<text x='732' y='295' fill='#7fc4ff' font-size='13.5' font-weight='700' text-anchor='end'>-68% · 3.2×</text>
 </svg>

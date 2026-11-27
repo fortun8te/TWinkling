@@ -18,12 +18,13 @@ void f32_to_bf16_rows(const float* src, int rows, int cols, __nv_bfloat16* dst, 
 
 // Device pointers of the recurrent decode state a step overwrites besides the cache rows at its own
 // positions: the conv states (fp32 [48, 3, C], oldest input first; C = KV_DIM for k/v, HIDDEN for attn/mlp)
-// and the sliding rings (k/v bf16 [40, WINDOW, KV_DIM], positions int64 [40, WINDOW]).
+// and the sliding rings (k/v bf16 or fp8 [40, WINDOW, KV_DIM], positions int64 [40, WINDOW]).
 struct StatePtrs {
   float* conv[4];  // conv_k, conv_v, conv_attn, conv_mlp
-  __nv_bfloat16* k_ring;
-  __nv_bfloat16* v_ring;
+  void* k_ring;
+  void* v_ring;
   std::int64_t* ring_pos;
+  bool ring_fp8 = false;
 };
 inline constexpr int CONV_COLS[4] = {KV_DIM, KV_DIM, HIDDEN, HIDDEN};
 inline constexpr int CONV_ROW_FLOATS = 2 * KV_DIM + 2 * HIDDEN;  // one row of all four conv states per visit
@@ -32,8 +33,8 @@ inline constexpr int CONV_ROW_FLOATS = 2 * KV_DIM + 2 * HIDDEN;  // one row of a
 // ring slot p % WINDOW of every sliding visit.
 struct StepUndo {
   float* conv;           // fp32 [48, CONV_ROW_FLOATS]: per visit k | v | attn | mlp
-  __nv_bfloat16* k;      // bf16 [40, KV_DIM]
-  __nv_bfloat16* v;      // bf16 [40, KV_DIM]
+  void* k;               // bf16 or fp8 [40, KV_DIM]
+  void* v;               // bf16 or fp8 [40, KV_DIM]
   std::int64_t* pos;     // int64 [40]
 };
 
@@ -41,8 +42,8 @@ struct StepUndo {
 // a rollback keeps at least one row) and ring slots (P + r) % WINDOW, r < m.
 struct VerifyBackup {
   float* conv[4];        // fp32 [48, 3, C] like the conv states (rows 1, 2 written)
-  __nv_bfloat16* k;      // bf16 [40, 8, KV_DIM]
-  __nv_bfloat16* v;      // bf16 [40, 8, KV_DIM]
+  void* k;               // bf16 or fp8 [40, 8, KV_DIM]
+  void* v;               // bf16 or fp8 [40, 8, KV_DIM]
   std::int64_t* pos;     // int64 [40, 8]
 };
 

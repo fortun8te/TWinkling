@@ -127,7 +127,8 @@ int main(int argc, char** argv) {
       const Experts& e = L.experts;
       return pk::MoeExperts{e.fmt == ExpertFormat::NVFP4 ? 0 : 1, e.w13.data, e.w13_scale.data,
                             static_cast<const float*>(e.w13_factor.data), e.w2.data, e.w2_scale.data,
-                            static_cast<const float*>(e.w2_factor.data)};
+                            static_cast<const float*>(e.w2_factor.data), 0, 0, nullptr, nullptr, nullptr, nullptr,
+                            e.w13_scale_base, e.w2_scale_base};
     };
     for (auto* set : {&nv, &mx}) {
       const bool nvfp4 = set == &nv;

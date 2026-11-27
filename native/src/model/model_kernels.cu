@@ -19,7 +19,12 @@ constexpr int kThreads = 256;
 constexpr int kMaxRows = 8;                      // widest decode call
 constexpr int kRowVec = CONV_ROW_FLOATS / 4;     // float4 per visit across the four conv states (1664)
 constexpr int kConvVecs = NUM_VISITS * kRowVec;  // float4 per conv-state row of all visits
-constexpr int kRingVec = KV_DIM * 2 / 16;        // uint4 per ring slot row (128)
+constexpr int kRingVecBf16 = KV_DIM * 2 / 16;    // uint4 per BF16 ring slot row (128)
+constexpr int kRingVecFp8 = KV_DIM / 16;         // uint4 per FP8 ring slot row (64)
+
+__host__ __device__ __forceinline__ int ring_vecs_of(const StatePtrs& st) {
+  return st.ring_fp8 ? kRingVecFp8 : kRingVecBf16;
+}
 
 // float4 q of [visit][k | v | attn | mlp] -> (tensor, visit, float4 column, float4 per row of the tensor)
 struct ConvAt {
@@ -38,8 +43,8 @@ __device__ __forceinline__ float4* conv_row(float* const* conv, const ConvAt& a,
   return reinterpret_cast<float4*>(conv[a.t]) + (std::size_t(a.v) * 3 + row) * a.cols + a.c;
 }
 
-__device__ __forceinline__ uint4* ring_row(__nv_bfloat16* ring, int r, int slot) {
-  return reinterpret_cast<uint4*>(ring + (std::size_t(r) * WINDOW + slot) * KV_DIM);
+__device__ __forceinline__ uint4* ring_row(void* ring, int r, int slot, int rvec) {
+  return reinterpret_cast<uint4*>(ring) + (std::size_t(r) * WINDOW + slot) * rvec;
 }
 
 unsigned blocks_for(long long items) { return unsigned((items + kThreads - 1) / kThreads); }
@@ -56,7 +61,7 @@ __global__ void set_step_inputs_kernel(StepInputs in, long long* __restrict__ to
   if (i == 0) *pos = in.pos;
 }
 
-// items: conv row 0 (kConvVecs float4), ring k and v slots (40 * 2 * kRingVec uint4), ring positions (40)
+// items: conv row 0 (kConvVecs float4), ring k and v slots (40 * 2 * rvec uint4), ring positions (40)
 __global__ void chain_advance_kernel(const int* __restrict__ sampled, long long* __restrict__ token,
                                      long long* __restrict__ pos, int position, volatile int* host_token,
                                      StatePtrs st, StepUndo undo) {
@@ -73,16 +78,17 @@ __global__ void chain_advance_kernel(const int* __restrict__ sampled, long long*
     reinterpret_cast<float4*>(undo.conv)[i] = *conv_row(st.conv, a, 0);
     return;
   }
+  const int rvec = ring_vecs_of(st);
   int j = i - kConvVecs;
-  if (j < NUM_SLIDING_VISITS * 2 * kRingVec) {
-    const int r = j / (2 * kRingVec), k = j % (2 * kRingVec);
-    if (k < kRingVec)
-      reinterpret_cast<uint4*>(undo.k)[r * kRingVec + k] = ring_row(st.k_ring, r, slot)[k];
+  if (j < NUM_SLIDING_VISITS * 2 * rvec) {
+    const int r = j / (2 * rvec), k = j % (2 * rvec);
+    if (k < rvec)
+      reinterpret_cast<uint4*>(undo.k)[r * rvec + k] = ring_row(st.k_ring, r, slot, rvec)[k];
     else
-      reinterpret_cast<uint4*>(undo.v)[r * kRingVec + k - kRingVec] = ring_row(st.v_ring, r, slot)[k - kRingVec];
+      reinterpret_cast<uint4*>(undo.v)[r * rvec + k - rvec] = ring_row(st.v_ring, r, slot, rvec)[k - rvec];
     return;
   }
-  j -= NUM_SLIDING_VISITS * 2 * kRingVec;
+  j -= NUM_SLIDING_VISITS * 2 * rvec;
   if (j < NUM_SLIDING_VISITS) undo.pos[j] = st.ring_pos[std::size_t(j) * WINDOW + slot];
 }
 
@@ -100,20 +106,21 @@ __global__ void chain_undo_kernel(StatePtrs st, StepUndo undo, int position) {
     *r0 = reinterpret_cast<const float4*>(undo.conv)[i];
     return;
   }
+  const int rvec = ring_vecs_of(st);
   int j = i - kConvVecs;
-  if (j < NUM_SLIDING_VISITS * 2 * kRingVec) {
-    const int r = j / (2 * kRingVec), k = j % (2 * kRingVec);
-    if (k < kRingVec)
-      ring_row(st.k_ring, r, slot)[k] = reinterpret_cast<const uint4*>(undo.k)[r * kRingVec + k];
+  if (j < NUM_SLIDING_VISITS * 2 * rvec) {
+    const int r = j / (2 * rvec), k = j % (2 * rvec);
+    if (k < rvec)
+      ring_row(st.k_ring, r, slot, rvec)[k] = reinterpret_cast<const uint4*>(undo.k)[r * rvec + k];
     else
-      ring_row(st.v_ring, r, slot)[k - kRingVec] = reinterpret_cast<const uint4*>(undo.v)[r * kRingVec + k - kRingVec];
+      ring_row(st.v_ring, r, slot, rvec)[k - rvec] = reinterpret_cast<const uint4*>(undo.v)[r * rvec + k - rvec];
     return;
   }
-  j -= NUM_SLIDING_VISITS * 2 * kRingVec;
+  j -= NUM_SLIDING_VISITS * 2 * rvec;
   if (j < NUM_SLIDING_VISITS) st.ring_pos[std::size_t(j) * WINDOW + slot] = undo.pos[j];
 }
 
-// items: conv rows 1, 2 (2 * kConvVecs), ring k/v rows r < m (40 * m * 2 * kRingVec), positions (40 * m)
+// items: conv rows 1, 2 (2 * kConvVecs), ring k/v rows r < m (40 * m * 2 * rvec), positions (40 * m)
 __global__ void verify_save_kernel(StatePtrs st, VerifyBackup bk, const long long* __restrict__ pos_dev,
                                    int pos_host, int m) {
   const int i = blockIdx.x * kThreads + threadIdx.x;
@@ -124,17 +131,18 @@ __global__ void verify_save_kernel(StatePtrs st, VerifyBackup bk, const long lon
     return;
   }
   const int P = pos_dev ? int(*pos_dev) : pos_host;
+  const int rvec = ring_vecs_of(st);
   int j = i - 2 * kConvVecs;
-  const int per_ring = m * 2 * kRingVec;
+  const int per_ring = m * 2 * rvec;
   if (j < NUM_SLIDING_VISITS * per_ring) {
     const int r = j / per_ring, k = j % per_ring;
-    const int row = k / (2 * kRingVec), c = k % (2 * kRingVec);
+    const int row = k / (2 * rvec), c = k % (2 * rvec);
     const int slot = (P + row) % WINDOW;
-    const std::size_t b = (std::size_t(r) * kMaxRows + row) * kRingVec;
-    if (c < kRingVec)
-      reinterpret_cast<uint4*>(bk.k)[b + c] = ring_row(st.k_ring, r, slot)[c];
+    const std::size_t b = (std::size_t(r) * kMaxRows + row) * rvec;
+    if (c < rvec)
+      reinterpret_cast<uint4*>(bk.k)[b + c] = ring_row(st.k_ring, r, slot, rvec)[c];
     else
-      reinterpret_cast<uint4*>(bk.v)[b + c - kRingVec] = ring_row(st.v_ring, r, slot)[c - kRingVec];
+      reinterpret_cast<uint4*>(bk.v)[b + c - rvec] = ring_row(st.v_ring, r, slot, rvec)[c - rvec];
     return;
   }
   j -= NUM_SLIDING_VISITS * per_ring;
@@ -163,18 +171,19 @@ __global__ void verify_rollback_kernel(StatePtrs st, VerifyBackup bk, Hist hist,
     return;
   }
   const int P = pos_dev ? int(*pos_dev) : pos_host;
+  const int rvec = ring_vecs_of(st);
   int j = i - 3 * kConvVecs;
-  const int per_ring = m * 2 * kRingVec;
+  const int per_ring = m * 2 * rvec;
   if (j < NUM_SLIDING_VISITS * per_ring) {
     const int r = j / per_ring, k = j % per_ring;
-    const int row = k / (2 * kRingVec), c = k % (2 * kRingVec);
+    const int row = k / (2 * rvec), c = k % (2 * rvec);
     if (row < commit) return;
     const int slot = (P + row) % WINDOW;
-    const std::size_t b = (std::size_t(r) * kMaxRows + row) * kRingVec;
-    if (c < kRingVec)
-      ring_row(st.k_ring, r, slot)[c] = reinterpret_cast<const uint4*>(bk.k)[b + c];
+    const std::size_t b = (std::size_t(r) * kMaxRows + row) * rvec;
+    if (c < rvec)
+      ring_row(st.k_ring, r, slot, rvec)[c] = reinterpret_cast<const uint4*>(bk.k)[b + c];
     else
-      ring_row(st.v_ring, r, slot)[c - kRingVec] = reinterpret_cast<const uint4*>(bk.v)[b + c - kRingVec];
+      ring_row(st.v_ring, r, slot, rvec)[c - rvec] = reinterpret_cast<const uint4*>(bk.v)[b + c - rvec];
     return;
   }
   j -= NUM_SLIDING_VISITS * per_ring;
@@ -253,7 +262,8 @@ void set_step_inputs(const std::int32_t* tokens, int m, int position, std::int64
 
 void chain_advance(const std::int32_t* sampled, std::int64_t* token, std::int64_t* pos, int position,
                    std::int32_t* host_token, const StatePtrs& st, const StepUndo& undo, cudaStream_t stream) {
-  const long long items = kConvVecs + NUM_SLIDING_VISITS * (2 * kRingVec + 1);
+  const int rvec = ring_vecs_of(st);
+  const long long items = kConvVecs + NUM_SLIDING_VISITS * (2 * rvec + 1);
   chain_advance_kernel<<<blocks_for(items), kThreads, 0, stream>>>(sampled, reinterpret_cast<long long*>(token),
                                                                    reinterpret_cast<long long*>(pos), position,
                                                                    host_token, checked(st), undo);
@@ -261,7 +271,8 @@ void chain_advance(const std::int32_t* sampled, std::int64_t* token, std::int64_
 }
 
 void chain_undo(const StatePtrs& st, const StepUndo& undo, int position, cudaStream_t stream) {
-  const long long items = kConvVecs + NUM_SLIDING_VISITS * (2 * kRingVec + 1);
+  const int rvec = ring_vecs_of(st);
+  const long long items = kConvVecs + NUM_SLIDING_VISITS * (2 * rvec + 1);
   chain_undo_kernel<<<blocks_for(items), kThreads, 0, stream>>>(checked(st), undo, position);
   CUDA_CHECK(cudaGetLastError());
 }
@@ -269,7 +280,8 @@ void chain_undo(const StatePtrs& st, const StepUndo& undo, int position, cudaStr
 void verify_save(const StatePtrs& st, const VerifyBackup& bk, const std::int64_t* pos_dev, int pos_host, int m,
                  cudaStream_t stream) {
   if (m < 1 || m > kMaxRows) throw std::invalid_argument("verify_save: width out of range");
-  const long long items = 2LL * kConvVecs + NUM_SLIDING_VISITS * m * (2 * kRingVec + 1);
+  const int rvec = ring_vecs_of(st);
+  const long long items = 2LL * kConvVecs + NUM_SLIDING_VISITS * m * (2 * rvec + 1);
   verify_save_kernel<<<blocks_for(items), kThreads, 0, stream>>>(
       checked(st), bk, reinterpret_cast<const long long*>(pos_dev), pos_host, m);
   CUDA_CHECK(cudaGetLastError());
@@ -281,7 +293,8 @@ void verify_rollback(const StatePtrs& st, const VerifyBackup& bk, const float* c
   if (m < 1 || m > kMaxRows) throw std::invalid_argument("verify_rollback: width out of range");
   if (!accepted_dev && (commit_host < 1 || commit_host > m))
     throw std::invalid_argument("verify_rollback: commit out of range");
-  const long long items = 3LL * kConvVecs + NUM_SLIDING_VISITS * m * (2 * kRingVec + 1);
+  const int rvec = ring_vecs_of(st);
+  const long long items = 3LL * kConvVecs + NUM_SLIDING_VISITS * m * (2 * rvec + 1);
   const Hist h{{hist[0], hist[1], hist[2], hist[3]}};
   verify_rollback_kernel<<<blocks_for(items), kThreads, 0, stream>>>(
       checked(st), bk, h, reinterpret_cast<const long long*>(pos_dev), pos_host, accepted_dev, commit_host, m);

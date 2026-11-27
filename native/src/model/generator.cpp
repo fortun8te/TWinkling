@@ -68,6 +68,7 @@ class EngineGenerator final : public Generator {
         token_(sizeof(std::int32_t)),
         host_token_(sizeof(std::int32_t)) {
     if (options.prefill_chunk < 1) throw std::invalid_argument("prefill_chunk must be positive");
+    rt_.setup_prefill_lend(prefiller_.lend_arena(), prefiller_.lend_arena_bytes());
     if (options.spec) {
       drafter_ = std::make_unique<Drafter>(options.model_dir, rt_.weights(), options.max_ctx, rt_.stream(),
                                            options.spec_shortlist_rows);
@@ -145,10 +146,12 @@ class EngineGenerator final : public Generator {
         stats.prefill_seconds = seconds_since(t);
         t = std::chrono::steady_clock::now();
         if (max_new_tokens > 0) {
+          rt_.populate_prefill_lend();
           drafter_->set_seed(rng.seed);
           spec_->generate(token, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, tokens_in_state_);
         }
       } else {
+        if (max_new_tokens > 1) rt_.populate_prefill_lend();
         decode(n, max_new_tokens, sampling, rng, stop_ids, on_tokens, stats, t);
       }
       CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
@@ -326,6 +329,10 @@ class EngineGenerator final : public Generator {
       ++next_image;  // inside the reused prefix
     }
     std::vector<EmbedRows> rows;
+    if (start < n) {
+      rt_.vacate_prefill_lend();
+      prefiller_.sync_transfer_after_stream(stream);
+    }
     for (std::size_t s = start; s < n; s += chunk) {
       const int T = int(std::min(chunk, n - s));
       for (; next_image < images.size() && std::size_t(images[next_image].pos) < s + std::size_t(T); ++next_image) {
@@ -351,20 +358,25 @@ class EngineGenerator final : public Generator {
       }
       CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, ids.data() + s, std::size_t(T) * sizeof(std::int32_t),
                                  cudaMemcpyHostToDevice, stream));
+      const std::size_t chunk_end = s + std::size_t(T);
+      const std::size_t dspark_keep =
+          drafter_ ? std::max<std::size_t>(std::size_t(drafter_->ctx()), std::size_t(WINDOW)) : 0;
+      const bool need_dspark_chunk = drafter_ && (chunk_end > (n > dspark_keep ? n - dspark_keep : 0));
+      const bool need_taps = need_dspark_chunk || flash_;
+      float* chunk_logits = (chunk_end == n) ? static_cast<float*>(logits_.p) : nullptr;
       Tensor taps;
-      if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
-      prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
-                     drafter_ ? &taps : nullptr, rows);
+      if (need_taps) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
+      prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), chunk_logits,
+                     need_taps ? &taps : nullptr, rows);
       if (drafter_) {
         // Only note the tail 6144 prompt tokens so long prompts do not fill CONTEXT_ROWS with early filler
         // and lock out the end of the prompt + generated tokens.
         const std::size_t tail_start = n > 6144 ? n - 6144 : 0;
-        const std::size_t chunk_end = s + std::size_t(T);
         if (chunk_end > tail_start) {
           const std::size_t lo = std::max(s, tail_start);
           drafter_->note_tokens(ids.subspan(lo, chunk_end - lo));
         }
-        drafter_->commit(taps, int(s));
+        drafter_->commit(need_dspark_chunk ? static_cast<const __nv_bfloat16*>(taps_.p) : nullptr, T, int(s), int(n));
       }
       if (flash_) flash_->commit(static_cast<const __nv_bfloat16*>(taps_.p), T, int(s), false);
     }

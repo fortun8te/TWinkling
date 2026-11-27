@@ -2,6 +2,7 @@
 // gate/up and down GEMMs over NVFP4 and MXFP8 experts (decoded as model.decode_experts), slot-ordered combine.
 // Only the first kAlloc experts hold weights; the router bias steers every token to them (several tiles per
 // expert, partial tiles).
+#include "kernels/moe/scale6.cuh"
 #include "kernels/prefill/prefill.h"
 #include "prefill/prefill_test.h"
 
@@ -217,6 +218,145 @@ bool run(Rng& rng, int fmt, int T) {
   return ok;
 }
 
+std::vector<uint32_t> pack_scales_host(const std::vector<uint8_t>& scales, int& out_base) {
+  auto [lo_it, hi_it] = std::minmax_element(scales.begin(), scales.end());
+  out_base = int(*lo_it);
+  std::vector<uint32_t> packed((scales.size() / 16) * 3 + 1, 0u);
+  for (size_t g = 0; g < scales.size() / 16; ++g)
+    ingine::kernels::moe::pack16_6bit(scales.data() + g * 16, packed.data() + g * 3, uint8_t(out_base));
+  return packed;
+}
+
+bool test_pack6_and_w4a4_fused(Rng& rng, int T) {
+  std::printf("-- NVFP4 pack6 + W4A4 fused_actq, T=%d\n", T);
+  const Mat w13 = make_mat(rng, 0, 2 * I, H), w2 = make_mat(rng, 0, H, I);
+  int b13 = -1, b2 = -1;
+  const auto p13 = pack_scales_host(w13.scales, b13);
+  const auto p2 = pack_scales_host(w2.scales, b2);
+
+  std::vector<float> logits(size_t(T) * E), bias(E);
+  for (auto& v : logits) v = float(rng.normal() * 2);
+  for (int e = 0; e < E; ++e) bias[e] = e < kAlloc ? float(rng.uniform(-0.1, 0.1)) : -1e30f;
+  std::vector<uint16_t> x(size_t(T) * H);
+  for (auto& v : x) v = bf16_bits(float(rng.normal()));
+
+  DeviceArray<float> d_logits(logits), d_bias(bias), d_wts(size_t(T) * TOPK);
+  DeviceArray<int> d_idx(size_t(T) * TOPK), counts(E), tiles_n(1), pair_token(size_t(T) * TOPK),
+      pair_dst(size_t(T) * TOPK);
+  DeviceArray<int4> tiles(pk::moe_tiles_capacity(T));
+  DeviceArray<uint8_t> c13(w13.codes), s13(w13.scales), c2(w2.codes), s2(w2.scales);
+  DeviceArray<uint32_t> ps13(p13), ps2(p2);
+  DeviceArray<float> f13(w13.factor), f2(w2.factor);
+  DeviceArray<uint16_t> d_x(x);
+  pk::MoeWork wk{counts.get(), tiles_n.get(), tiles.get(), pair_token.get(), pair_dst.get()};
+  pk::MoeExperts ex_raw{0, c13.get(), s13.get(), f13.get(), c2.get(), s2.get(), f2.get()};
+  pk::MoeExperts ex_pk = ex_raw;
+  ex_pk.w13_scale = ps13.get(), ex_pk.w2_scale = ps2.get();
+  ex_pk.w13_scale_base = b13, ex_pk.w2_scale_base = b2;
+
+  INGINE_TEST_CUDA(cudaMemset(counts.get(), 0, size_t(E) * sizeof(int)));
+  pk::moe_topk(d_logits.get(), d_bias.get(), T, d_idx.get(), d_wts.get(), counts.get(), nullptr);
+  pk::moe_route(d_idx.get(), T, wk, nullptr);
+
+  // 1) wgemm_kernel (qscratch = nullptr): 6-bit packed vs raw scales bit-exact.
+  DeviceArray<uint16_t> act_raw(size_t(T) * TOPK * I), act_pk(size_t(T) * TOPK * I);
+  DeviceArray<uint16_t> down_raw(size_t(T) * TOPK * H), down_pk(size_t(T) * TOPK * H);
+  pk::moe_gate_up(ex_raw, reinterpret_cast<const __nv_bfloat16*>(d_x.get()), T, wk,
+                  reinterpret_cast<__nv_bfloat16*>(act_raw.get()), nullptr, nullptr);
+  pk::moe_down(ex_raw, reinterpret_cast<const __nv_bfloat16*>(act_raw.get()), T, wk,
+               reinterpret_cast<__nv_bfloat16*>(down_raw.get()), nullptr, nullptr);
+  pk::moe_gate_up(ex_pk, reinterpret_cast<const __nv_bfloat16*>(d_x.get()), T, wk,
+                  reinterpret_cast<__nv_bfloat16*>(act_pk.get()), nullptr, nullptr);
+  pk::moe_down(ex_pk, reinterpret_cast<const __nv_bfloat16*>(act_pk.get()), T, wk,
+               reinterpret_cast<__nv_bfloat16*>(down_pk.get()), nullptr, nullptr);
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+
+  bool ok = true;
+  {
+    const auto a0 = act_raw.download(), a1 = act_pk.download();
+    const auto d0 = down_raw.download(), d1 = down_pk.download();
+    size_t bad = 0;
+    for (size_t i = 0; i < a0.size(); ++i) bad += a0[i] != a1[i];
+    for (size_t i = 0; i < d0.size(); ++i) bad += d0[i] != d1[i];
+    std::printf("%s wgemm pack6 vs raw: %zu bit mismatches\n", bad ? "FAIL" : "PASS", bad);
+    ok &= bad == 0;
+  }
+
+  // 2) W4A4 + fused_actq (T >= 64): pack6 vs raw bit-exact on moe_down(prequantized=true), plus FP64 oracle
+  // on decoded out_xq/out_xscale -> w2 * act_q_dec.
+  if (pk::moe_fused_actq_active(0, T)) {
+    const int pairs = T * TOPK;
+    DeviceArray<uint8_t> xq_up(size_t(T) * H / 2), xs_up(size_t(T) * H / 16);
+    DeviceArray<float> xo_up(T);
+    DeviceArray<uint8_t> aq_raw(size_t(pairs) * I / 2), as_raw(size_t(pairs) * I / 16);
+    DeviceArray<uint8_t> aq_pk(size_t(pairs) * I / 2), as_pk(size_t(pairs) * I / 16);
+    DeviceArray<uint16_t> dw_raw(size_t(pairs) * H), dw_pk(size_t(pairs) * H);
+
+    pk::MoeQuantScratch qu{xq_up.get(), xs_up.get(), xo_up.get()};
+    pk::MoeQuantScratch qd;
+    qd.xouter_const = pk::kFusedActOuter;
+    qd.prequantized = true;
+
+    qu.out_xq = aq_raw.get(), qu.out_xscale = as_raw.get();
+    qd.xq = aq_raw.get(), qd.xscale = as_raw.get();
+    pk::moe_gate_up(ex_raw, reinterpret_cast<const __nv_bfloat16*>(d_x.get()), T, wk,
+                    reinterpret_cast<__nv_bfloat16*>(act_raw.get()), nullptr, &qu);
+    pk::moe_down(ex_raw, reinterpret_cast<const __nv_bfloat16*>(act_raw.get()), T, wk,
+                 reinterpret_cast<__nv_bfloat16*>(dw_raw.get()), nullptr, &qd);
+
+    qu.out_xq = aq_pk.get(), qu.out_xscale = as_pk.get();
+    qd.xq = aq_pk.get(), qd.xscale = as_pk.get();
+    pk::moe_gate_up(ex_pk, reinterpret_cast<const __nv_bfloat16*>(d_x.get()), T, wk,
+                    reinterpret_cast<__nv_bfloat16*>(act_pk.get()), nullptr, &qu);
+    pk::moe_down(ex_pk, reinterpret_cast<const __nv_bfloat16*>(act_pk.get()), T, wk,
+                 reinterpret_cast<__nv_bfloat16*>(dw_pk.get()), nullptr, &qd);
+    INGINE_TEST_CUDA(cudaDeviceSynchronize());
+
+    const auto qr0 = aq_raw.download(), qr1 = aq_pk.download();
+    const auto sr0 = as_raw.download(), sr1 = as_pk.download();
+    const auto wd0 = dw_raw.download(), wd1 = dw_pk.download();
+    size_t bad = 0;
+    for (size_t i = 0; i < qr0.size(); ++i) bad += qr0[i] != qr1[i];
+    for (size_t i = 0; i < sr0.size(); ++i) bad += sr0[i] != sr1[i];
+    for (size_t i = 0; i < wd0.size(); ++i) bad += wd0[i] != wd1[i];
+    std::printf("%s w4a4 fused_actq pack6 vs raw: %zu bit mismatches\n", bad ? "FAIL" : "PASS", bad);
+    ok &= bad == 0;
+
+    // Decode fused act_q (out_xq, out_xscale, kFusedActOuter) and check moe_down(prequantized=true) against FP64 oracle.
+    const auto idx = d_idx.download();
+    const auto pdst = pair_dst.download();
+    std::vector<int> pos_of(pairs);
+    for (int pp = 0; pp < pairs; ++pp) pos_of[pdst[pp]] = pp;
+    std::vector<float> got_d;
+    std::vector<double> ref_d, abs_d;
+    for (int t = 0; t < T; t += 7) {
+      for (int k = 0; k < TOPK; ++k) {
+        const int dst = t * TOPK + k, e = idx[dst], pp = pos_of[dst];
+        for (int n = 0; n < H; n += 9) {
+          double acc = 0, ssum = 0;
+          for (int c = 0; c < I; ++c) {
+            const uint8_t qb = qr1[size_t(pp) * (I / 2) + c / 2];
+            const uint8_t sb = sr1[size_t(pp) * (I / 16) + c / 16];
+            const double av = double(kE2M1[(c & 1) ? qb >> 4 : qb & 0xf]) * double(e4m3_to_float(sb)) *
+                              double(pk::kFusedActOuter);
+            const uint8_t wb = w2.codes[(size_t(e) * H + n) * (I / 2) + c / 2];
+            const uint8_t wsb = w2.scales[(size_t(e) * H + n) * (I / 16) + c / 16];
+            const double wv = double(kE2M1[(c & 1) ? wb >> 4 : wb & 0xf]) * double(e4m3_to_float(wsb)) *
+                              double(w2.factor[e]);
+            const double term = wv * av;
+            acc += term, ssum += std::fabs(term);
+          }
+          ref_d.push_back(acc);
+          abs_d.push_back(1e-5 * ssum + 1e-6);
+          got_d.push_back(bf16_val(wd1[size_t(dst) * H + n]));
+        }
+      }
+    }
+    ok &= check_close("w4a4 fused_actq down", got_d, ref_d, 6e-3, abs_d);
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -228,6 +368,7 @@ int main() {
   ok &= run(rng, 0, 9);
   ok &= run(rng, 0, 700);  // 128-row tiles (T > 512)
   ok &= run(rng, 1, 700);
+  ok &= test_pack6_and_w4a4_fused(rng, 200);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

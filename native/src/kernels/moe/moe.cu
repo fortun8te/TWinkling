@@ -42,6 +42,7 @@
 //   M is a launch-shape parameter of the captured graph and all routing is read from device memory.
 // Ported from engine/csrc/moe/moe.cu (kernel bodies unchanged; torch launchers -> raw pointers).
 #include "kernels/moe/moe.h"
+#include "kernels/moe/scale6.cuh"
 
 #include "kernels/common/l2.cuh"
 
@@ -97,6 +98,12 @@ __device__ __forceinline__ uint8_t ld_scale1(const void* p, std::uint64_t pol) {
     if constexpr (l2::hinted<WEIGHT_L2>) asm volatile("ld.global.nc.L2::cache_hint.u8 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
     else asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
     return uint8_t(v);
+}
+__device__ __forceinline__ uint32_t ld_scale4(const uint32_t* p, std::uint64_t pol) {
+    uint32_t v;
+    if constexpr (l2::hinted<WEIGHT_L2>) asm volatile("ld.global.nc.L2::cache_hint.u32 %0, [%1], %2;" : "=r"(v) : "l"(p), "l"(pol));
+    else asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
 }
 
 // Inputs written by earlier kernels (x, act, idx, wts, conv_state) use coherent loads in volatile asm with a
@@ -154,6 +161,19 @@ __device__ __forceinline__ Chunk<FMT> load_chunk(const uint8_t* codes, const uin
         ch.q1 = ld_stream(codes + 32 * c + 16, pol);
         ch.s = ld_scale1(scales + c, pol);
     }
+    return ch;
+}
+
+__device__ __forceinline__ Chunk<0> load_chunk_packed(const uint8_t* codes, const uint32_t* ws32, size_t row, int SB,
+                                                      int c, uint8_t base, std::uint64_t pol) {
+    Chunk<0> ch;
+    ch.q = ld_stream(codes + 16 * c, pol);
+    const uint64_t bit = (uint64_t(row) * SB + 2 * c) * 6;
+    const size_t widx = size_t(bit >> 5);
+    const uint32_t sh = uint32_t(bit & 31u);
+    const uint32_t w0 = ld_scale4(ws32 + widx, pol);
+    const uint32_t w1 = (sh > 20) ? ld_scale4(ws32 + widx + 1, pol) : 0u;
+    ch.s = unpack2_6bit_from_words(w0, w1, sh, base);
     return ch;
 }
 
@@ -239,13 +259,21 @@ struct Frag {
     float factor;
 };
 
-// Weights: `codes`/`scales` point at row g of the tile (row g+8 is 8 rows further).
-template <int FMT, int K>
-__device__ __forceinline__ void load_w(Frag<FMT>& f, const uint8_t* codes, const uint8_t* scales, int c,
-                                       float factor, std::uint64_t pol) {
+// Weights: `codes` points at row g of the tile (row g+8 is 8 rows further); `ws_base` is the base of the
+// scale tensor (`row` selects row g).
+template <int FMT, int K, bool PACK6 = false>
+__device__ __forceinline__ void load_w(Frag<FMT>& f, const uint8_t* codes, const uint8_t* ws_base, size_t row, int c,
+                                       float factor, uint8_t scale_base, std::uint64_t pol) {
     constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
-    f.r0 = load_chunk<FMT>(codes, scales, c, pol);
-    f.r1 = load_chunk<FMT>(codes + 8 * CB, scales + 8 * SB, c, pol);
+    if constexpr (PACK6 && FMT == 0) {
+        const uint32_t* ws32 = reinterpret_cast<const uint32_t*>(ws_base);
+        f.r0 = load_chunk_packed(codes, ws32, row, SB, c, scale_base, pol);
+        f.r1 = load_chunk_packed(codes + 8 * CB, ws32, row + 8, SB, c, scale_base, pol);
+    } else {
+        const uint8_t* scales = ws_base + row * SB;
+        f.r0 = load_chunk<FMT>(codes, scales, c, pol);
+        f.r1 = load_chunk<FMT>(codes + 8 * CB, scales + 8 * SB, c, pol);
+    }
     f.factor = factor;
 }
 
@@ -290,13 +318,14 @@ __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(_
 
 // --------------------------------------------------------------------------------------- moe_up
 
-template <int FMT>
+template <int FMT, bool PACK6 = false>
 __global__ void __launch_bounds__(UP_WARPS * 32)
 moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
               const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
-              __nv_bfloat16* __restrict__ out) {
+              __nv_bfloat16* __restrict__ out, uint8_t scale_base, const ExpertLend* __restrict__ lend,
+              const int* __restrict__ lend_active) {
     constexpr int K = H, R = 2 * I;
-    constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
+    constexpr int CB = Layout<FMT>::code_bytes(K);
     __shared__ float red[UP_WARPS][32][4];
     __shared__ float tile_out[TILE][MAXM + 1];
 
@@ -312,11 +341,21 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
     const uint64_t mask = slot_mask(e, lo, hi);
     if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
 
-    const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+    const uint8_t* w_ptr = w;
+    const uint8_t* ws_ptr = ws;
+    size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+    if (lend && lend_active && ld_dep(lend_active) != 0) {
+        const int lf = lend->first, lc = lend->count;
+        if (e >= lf && e < lf + lc) {
+            w_ptr = static_cast<const uint8_t*>(lend->w13);
+            ws_ptr = static_cast<const uint8_t*>(lend->w13_scale);
+            row = static_cast<size_t>(e - lf) * R + tile * TILE + g;
+        }
+    }
     const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
     Frag<FMT> f;
-    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
-                   l2::policy<WEIGHT_L2>());
+    load_w<FMT, K, PACK6>(f, w_ptr + row * CB, ws_ptr, row, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f, scale_base,
+                          l2::policy<WEIGHT_L2>());
     load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
     float d[4] = {0.f, 0.f, 0.f, 0.f};
     mma_frag(f, d);
@@ -355,14 +394,15 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
 
 // ------------------------------------------------------------------------------------- moe_down
 
-template <int FMT>
+template <int FMT, bool PACK6 = false>
 __global__ void __launch_bounds__(DOWN_WARPS * 32)
 moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
                 const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
                 int M, const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
-                float* __restrict__ conv_hist) {
+                float* __restrict__ conv_hist, uint8_t scale_base, const ExpertLend* __restrict__ lend,
+                const int* __restrict__ lend_active) {
     constexpr int K = I, R = H;
-    constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
+    constexpr int CB = Layout<FMT>::code_bytes(K);
     __shared__ float part[DOWN_WARPS][32][4];        // per-warp partial dots of the current round
     __shared__ float ybuf[TOPK * MAXM][TILE][MAXM];  // BF16-rounded expert outputs [unique expert][row][token]
     __shared__ int uexp[TOPK * MAXM];                // unique experts in first-slot order
@@ -403,10 +443,18 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
         return kmask ? act + (static_cast<size_t>(g) * TOPK + (__ffs(kmask) - 1)) * K : nullptr;
     };
     const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+    const bool use_lend = lend && lend_active && ld_dep(lend_active) != 0 && lend->count > 0;
+    const int lf = use_lend ? lend->first : 0;
+    const int lc = use_lend ? lend->count : 0;
+    const uint8_t* const lw = use_lend ? static_cast<const uint8_t*>(lend->w2) : nullptr;
+    const uint8_t* const lws = use_lend ? static_cast<const uint8_t*>(lend->w2_scale) : nullptr;
     auto load = [&](int u, Frag<FMT>& f) {
         const int e = uexp[u];
-        const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
-        load_w<FMT, K>(f, w + row * CB, ws + row * SB, c, FMT == 0 ? wfactor[e] : 1.f, wpol);
+        const bool lent = use_lend && e >= lf && e < lf + lc;
+        const uint8_t* const w_ptr = lent ? lw : w;
+        const uint8_t* const ws_ptr = lent ? lws : ws;
+        const size_t row = static_cast<size_t>(lent ? (e - lf) : e) * R + tile * TILE + g;
+        load_w<FMT, K, PACK6>(f, w_ptr + row * CB, ws_ptr, row, c, FMT == 0 ? wfactor[e] : 1.f, scale_base, wpol);
     };
 
     // The first round's weights do not depend on moe_up: fetch them before waiting for it (PDL).
@@ -506,27 +554,36 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
 }  // namespace
 
 void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, const void* w13_scale,
-            const float* w13_factor, Format fmt, __nv_bfloat16* out, bool pdl, cudaStream_t stream) {
+            const float* w13_factor, Format fmt, __nv_bfloat16* out, bool pdl, cudaStream_t stream,
+            int scale_base, const ExpertLend* lend, const int* lend_active) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
     require(fmt == Format::MXFP8 || w13_factor, "NVFP4 experts need a factor tensor");
+    require(scale_base >= -1 && scale_base <= 192, "scale_base out of range");
+    require(fmt == Format::NVFP4 || scale_base < 0, "packed scales are only supported for NVFP4");
     const bool nv = fmt == Format::NVFP4;
     const dim3 grid(2 * I / TILE, M * TOPK);
-    launch(nv ? moe_up_kernel<0> : moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx,
+    const auto fn = nv ? (scale_base >= 0 ? moe_up_kernel<0, true> : moe_up_kernel<0, false>) : moe_up_kernel<1, false>;
+    launch(fn, grid, UP_WARPS * 32, pdl, stream, x, idx,
            static_cast<const uint8_t*>(w13), static_cast<const uint8_t*>(w13_scale), nv ? w13_factor : nullptr, M,
-           out);
+           out, uint8_t(scale_base >= 0 ? scale_base : 0), lend, lend_active);
 }
 
 void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts, const void* w2,
               const void* w2_scale, const float* w2_factor, Format fmt, const float* conv_w, float* conv_state,
-              float* out, float* conv_hist, bool pdl, cudaStream_t stream) {
+              float* out, float* conv_hist, bool pdl, cudaStream_t stream, int scale_base,
+              const ExpertLend* lend, const int* lend_active) {
     require(M >= 1 && M <= MAXM, "M must be in 1..8");
     require(act && idx && wts && w2 && w2_scale && conv_w && conv_state && out, "moe_down: null argument");
     require(fmt == Format::MXFP8 || w2_factor, "NVFP4 experts need a factor tensor");
+    require(scale_base >= -1 && scale_base <= 192, "scale_base out of range");
+    require(fmt == Format::NVFP4 || scale_base < 0, "packed scales are only supported for NVFP4");
     const bool nv = fmt == Format::NVFP4;
-    launch(nv ? moe_down_kernel<0> : moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
+    const auto fn = nv ? (scale_base >= 0 ? moe_down_kernel<0, true> : moe_down_kernel<0, false>)
+                       : moe_down_kernel<1, false>;
+    launch(fn, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
            wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale), nv ? w2_factor : nullptr,
-           M, conv_w, conv_state, out, conv_hist);
+           M, conv_w, conv_state, out, conv_hist, uint8_t(scale_base >= 0 ? scale_base : 0), lend, lend_active);
 }
 
 }  // namespace ingine::kernels::moe

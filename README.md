@@ -8,15 +8,15 @@ TWinkling is a fork of [ingine](https://github.com/satellitedown/inkling-2-mini-
 
 | RTX 5080 · 250 W | Start | Now | Change |
 | --- | ---: | ---: | ---: |
-| Decode, 16K prompt | 139 tok/s | **290 tok/s** | **+109%** |
-| Decode, 128K prompt | 85 tok/s | **189 tok/s** | **+122%** |
-| Decode, 256K prompt | 57 tok/s | **138 tok/s** | **+142%** |
+| Decode, 16K prompt | 139 tok/s | **294 tok/s** | **+112%** |
+| Decode, 128K prompt | 85 tok/s | **208 tok/s** | **+145%** |
+| Decode, 256K prompt | 57 tok/s | **141 tok/s** | **+147%** |
 | First token, 16K | 4.3 s | **1.43 s** | **−67%** |
-| First token, 128K | 75.3 s | **20.3 s** | **−73%** |
-| First token, 256K | 182.5 s | **68.1 s** | **−63%** |
-| Load to ready | 12.3 s | **4.4 s** | **−64%** |
+| First token, 128K | 75.3 s | **19.9 s** | **−74%** |
+| First token, 256K | 182.5 s | **60.7 s** | **−67%** |
+| Load to ready | 12.3 s | **3.9 s** | **−68%** |
 
-Same fixtures, seeds and flags in every column. Decode is streamed tok/s on a real coding task with the prompt already in context. First token is a cold prefill of the whole prompt. "Start" is TWinkling `2739a8e`. Every "now" run passed its task checks: 8/8 at 16K, 3/4 at 128K (the start build scored 2/4 on the same fixture), 4/4 code, tool and recall at 256K. [Data and method](benchmarks/rtx5080/long-context/results.json)
+Same fixtures, seeds and flags in every column. Decode is streamed tok/s on a real coding task with the prompt already in context (recall reaches 315 / 193 / 123 tok/s, tool 380 / 208 / 146 tok/s). First token is a cold prefill of the whole prompt. "Start" is TWinkling `2739a8e`. Every "now" run kept >= 460 MiB free VRAM on WDDM and matched or beat quality: 4/4 at 16K (ALL-128, zero spill), 3/4 at 128K (recall/tool/decode pass; start build scored 2/4 on the same 1536-token fixture), 4/4 code, tool, recall and decode at 256K. [Data and method](benchmarks/rtx5080/long-context/results.json)
 
 ## Decode
 
@@ -51,10 +51,10 @@ Setup builds the SM120a server, verifies the model download and converts layers 
 
 | `TWINKLING_PROFILE` | Context | Expert placement | KV cache | Use it for |
 | --- | --- | --- | --- | --- |
-| `32k` | 32K | 12.4 GiB on GPU | FP8 K, 4-bit V, elastic | fastest chat and coding |
+| `32k` | 32K | **ALL-128** on GPU (0 spill, 6-bit packed scales) | FP8 K, 4-bit V, elastic | fastest chat and coding |
 | `64k` (default) | 64K | default plan | FP8 | general use |
-| `128k` | 128K | 11.2 GiB on GPU | 4-bit K and V | large repos and documents |
-| `256k` | 256K | 10.0 GiB on GPU | 4-bit K and V | whole codebases |
+| `128k` | 128K | 2,770 hot + 139 arena-lent = 2,909/3,072 decode | 4-bit K and V | large repos and documents |
+| `256k` | 256K | 2,501 hot + 139 arena-lent = 2,640/3,072 decode | 4-bit K and V | whole codebases |
 
 The `32k`, `128k` and `256k` profiles are the exact recipes measured above. Every profile keeps all experts and the original model behaviour; placement only decides which experts live in VRAM.
 
@@ -83,8 +83,9 @@ Every lever below was built, checked against an FP64 or reference oracle, and A/
 | DFlash2 block-diffusion drafter (ported from Frankengine) | 1.95 → 4.72 tokens per verify on copy-heavy replay, no gain on real coding tasks | `--dflash2 DIR` |
 | GSQ-RCO IQ3_S experts, whole model resident in 10.8 GB | Fits easily, but KL 0.040 vs NVFP4, top-1 agreement 90%, no decode gain | `INGINE_GGUF_EXPERTS=path` |
 | 4-bit (NVFP4) dense weights | KL 0.030, top-1 91.4%; quality cost outweighs a ~7% speed estimate | `INGINE_SIM_NVFP4_DENSE=1` |
+| FP8 sliding-window ring caches | Reclaims ~80 MiB, but raises KL 0.0083 → 0.0105 (top-1 95.2% → 94.5%); kept opt-in | `INGINE_RING_FP8=1` |
 | Split-K ring attention | Passes the oracle, time-neutral per decode round | `INGINE_RING_SPLITK=1` |
-| 16K full expert residency, 8-CTA cluster gates, DSpark thresholds 0.7/0.9 | No gain, out of memory, or within noise | n/a |
+| 8-CTA cluster gates, DSpark thresholds 0.7/0.9 | No gain or within noise | n/a |
 
 ## Earlier 64K benchmarks
 

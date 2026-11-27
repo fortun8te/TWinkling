@@ -67,9 +67,10 @@ class Drafter {
 
   // Committed target rows (feats bf16 [n, 4, H] on the device, positions start..start+n-1) become draft
   // context. n of 1..8 replays the small-commit graph (feats must stay valid until it ran); larger n
-  // (prefill chunks) runs eagerly in pieces of <= 1024.
-  void commit(const Tensor& feats, int start);
-  void commit(const __nv_bfloat16* feats, int n, int start);
+  // (prefill chunks) runs eagerly in pieces of <= 1024. When prompt_end > start + n, pieces whose positions
+  // will be overwritten before `prompt_end` finishes are skipped.
+  void commit(const Tensor& feats, int start, int prompt_end = -1);
+  void commit(const __nv_bfloat16* feats, int n, int start, int prompt_end = -1);
 
   // Drafts for positions P+1..P+7 after the anchor token at P. Greedy at temperature <= 0, otherwise
   // Gumbel-max at the temperature. Outputs are fixed device buffers, overwritten by the next draft.
@@ -149,7 +150,8 @@ class Drafter {
   void load(const std::filesystem::path& model_dir);
   void run_draft(int bucket);
   void run_layers(int bucket);                                                  // a draft after its input rows
-  void run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece);  // large commits
+  void run_commit(const __nv_bfloat16* feats, int n, int row0, bool do_local, bool do_global,
+                  bool do_frnn);  // large commits
   void run_small_commit();                                                      // from params_
   void run_advance(int bucket);                                                 // round transition
   int bucket_for(int P) const;

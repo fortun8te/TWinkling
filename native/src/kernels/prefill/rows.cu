@@ -246,6 +246,92 @@ __global__ void __launch_bounds__(ROW_T) gate_inputs_kernel(const GateRows rows,
   store_bf16x4(o + H + c, {m.x * rm, m.y * rm, m.z * rm, m.w * rm});
 }
 
+__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(r0), "=r"(r1)
+               : "r"(addr));
+}
+
+// Fused gate_inputs + down_proj GEMM: block computes 16 tokens x 64 rank cols for one gate g.
+__global__ void __launch_bounds__(256)
+    gate_down_fused_kernel(const GateRows rows, int T, const __nv_bfloat16* __restrict__ down,
+                           uint16_t* __restrict__ out) {
+  constexpr int BM = 16, BN = 64, BK = 64, NT = 256;
+  __shared__ float inv_h[BM], inv_m[BM];
+  __shared__ __align__(16) uint16_t sx[BM * BK];
+  __shared__ __align__(16) uint16_t sw[BN * BK];
+
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = blockIdx.y, t0 = blockIdx.x * BM;
+  const float* hp = rows.h[g];
+  const float* mp = rows.msg[g];
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    const int r = warp + 8 * j;
+    if (t0 + r < T) {
+      const float4* hr = reinterpret_cast<const float4*>(hp + size_t(t0 + r) * H);
+      const float4* mr = reinterpret_cast<const float4*>(mp + size_t(t0 + r) * H);
+      float sh = 0.f, sm = 0.f;
+      for (int c4 = lane; c4 < H / 4; c4 += 32) {
+        const float4 hv = hr[c4], mv = mr[c4];
+        sh += dot4(hv, hv);
+        sm += dot4(mv, mv);
+      }
+      sh = warp_sum(sh);
+      sm = warp_sum(sm);
+      if (lane == 0) {
+        inv_h[r] = rsqrtf(sh * (1.f / H) + kEps);
+        inv_m[r] = rsqrtf(sm * (1.f / H) + kEps);
+      }
+    }
+  }
+  __syncthreads();
+
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  const __nv_bfloat16* dg = down + size_t(g) * BN * 2 * H;
+#pragma unroll 1
+  for (int k0 = 0; k0 < 2 * H; k0 += BK) {
+    const float* xptr = k0 < H ? hp + k0 : mp + (k0 - H);
+    const float* iv = k0 < H ? inv_h : inv_m;
+    if (tid < BM * (BK / 8)) {
+      const int r = tid >> 3, ch = tid & 7;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (t0 + r < T) {
+        const float s = iv[r];
+        const float* p = xptr + size_t(t0 + r) * H + ch * 8;
+        const float4 a = *reinterpret_cast<const float4*>(p);
+        const float4 b = *reinterpret_cast<const float4*>(p + 4);
+        v = make_uint4(pack_bf16x2(a.x * s, a.y * s), pack_bf16x2(a.z * s, a.w * s),
+                       pack_bf16x2(b.x * s, b.y * s), pack_bf16x2(b.z * s, b.w * s));
+      }
+      *reinterpret_cast<uint4*>(sx + swz<8>(r, ch)) = v;
+    }
+    const __nv_bfloat16* wp = dg + k0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int id = tid + i * NT, r = id >> 3, ch = id & 7;
+      cp_async16(sw + swz<8>(r, ch), wp + size_t(r) * 2 * H + ch * 8);
+    }
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      unsigned a[4], b0, b1;
+      ldmatrix_x4(a[0], a[1], a[2], a[3], smem_addr(sx + swz<8>(lane & 15, kk * 2 + (lane >> 4))));
+      ldmatrix_x2(b0, b1, smem_addr(sw + swz<8>(warp * 8 + (lane & 7), kk * 2 + ((lane >> 3) & 1))));
+      mma_bf16(acc, a, b0, b1);
+    }
+    __syncthreads();
+  }
+
+  const int row0 = lane >> 2, row1 = row0 + 8, col = warp * 8 + (lane & 3) * 2;
+  uint16_t* dst = out + (size_t(g) * T + t0) * BN + col;
+  if (t0 + row0 < T) *reinterpret_cast<uint32_t*>(dst + size_t(row0) * BN) = pack_bf16x2(acc[0], acc[1]);
+  if (t0 + row1 < T) *reinterpret_cast<uint32_t*>(dst + size_t(row1) * BN) = pack_bf16x2(acc[2], acc[3]);
+}
+
 __global__ void __launch_bounds__(ROW_T) gate_apply_kernel(const float* __restrict__ h, const float* __restrict__ msg,
                                                            const float* __restrict__ f, const float* __restrict__ gn,
                                                            const float* __restrict__ norm_w, uint16_t* __restrict__ out) {
@@ -356,6 +442,12 @@ void conv_state_update(float* state, const __nv_bfloat16* x, int ld, int T, int 
 
 void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream) {
   gate_inputs_kernel<<<dim3(T, G), ROW_T, 0, stream>>>(rows, T, reinterpret_cast<uint16_t*>(gin));
+}
+
+void gate_down_fused(const GateRows& rows, int G, int T, const __nv_bfloat16* down, __nv_bfloat16* out,
+                     cudaStream_t stream) {
+  if (T <= 0 || G <= 0) return;
+  gate_down_fused_kernel<<<dim3((T + 15) / 16, G), 256, 0, stream>>>(rows, T, down, reinterpret_cast<uint16_t*>(out));
 }
 
 void gate_apply(const float* h, const float* msg, const float* f, const float* g, const float* norm_w, int T,

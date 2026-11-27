@@ -4,10 +4,20 @@
 #include "core/device.h"
 #include "kernels/common/value4.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ingine::model {
 namespace {
+
+bool ring_fp8_enabled() {
+  static const bool on = [] {
+    // Opt-in: FP8 sliding-window caches raise KL vs the reference from 0.0083 to 0.0105 (top-1 95.2% -> 94.5%).
+    const char* e = std::getenv("INGINE_RING_FP8");
+    return e && std::atoi(e) != 0;
+  }();
+  return on;
+}
 
 Tensor zeros(std::vector<DeviceBuffer>& storage, DType dt, std::initializer_list<std::int32_t> shape) {
   std::size_t n = 1;
@@ -20,10 +30,14 @@ Tensor zeros(std::vector<DeviceBuffer>& storage, DType dt, std::initializer_list
 }  // namespace
 
 Tensor State::k_ring_at(int ring) const {
-  return rm(ptr<char>(k_ring) + std::size_t(ring) * WINDOW * KV_DIM * 2, DType::BF16, {WINDOW, KV_HEADS, HEAD_DIM});
+  const std::size_t es = ring_fp8 ? 1 : 2;
+  return rm(ptr<char>(k_ring) + std::size_t(ring) * WINDOW * KV_DIM * es,
+            ring_fp8 ? DType::FP8_E4M3FN : DType::BF16, {WINDOW, KV_HEADS, HEAD_DIM});
 }
 Tensor State::v_ring_at(int ring) const {
-  return rm(ptr<char>(v_ring) + std::size_t(ring) * WINDOW * KV_DIM * 2, DType::BF16, {WINDOW, KV_HEADS, HEAD_DIM});
+  const std::size_t es = ring_fp8 ? 1 : 2;
+  return rm(ptr<char>(v_ring) + std::size_t(ring) * WINDOW * KV_DIM * es,
+            ring_fp8 ? DType::FP8_E4M3FN : DType::BF16, {WINDOW, KV_HEADS, HEAD_DIM});
 }
 std::int64_t* State::ring_pos_at(int ring) const { return ptr<std::int64_t>(ring_pos) + std::size_t(ring) * WINDOW; }
 Tensor State::k_full_at(int full) const {
@@ -81,11 +95,13 @@ State make_state(int max_ctx, bool kv_fp8, bool kv_v4, bool elastic_kv, bool kv_
   State st;
   st.max_ctx = max_ctx;
   st.kv_fp8 = kv_fp8;
+  st.ring_fp8 = kv_fp8 && ring_fp8_enabled();
   st.kv_v4 = kv_v4;
   st.kv_k4 = kv_k4;
   const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
-  st.k_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
-  st.v_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
+  const DType ring_dt = st.ring_fp8 ? DType::FP8_E4M3FN : DType::BF16;
+  st.k_ring = zeros(st.storage, ring_dt, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
+  st.v_ring = zeros(st.storage, ring_dt, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
   if (elastic_kv) {

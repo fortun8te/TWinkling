@@ -163,14 +163,26 @@ bool full_case(Rng& rng, bool fp8, int pos0, int T, bool v4 = false) {
 }
 
 // Sliding visit: ring state before the chunk (ring_pos per slot), chunk keys, gathered rows.
-bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
+bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride, bool fp8 = false) {
   std::vector<float> ringK(size_t(W) * HK * D), ringV(ringK.size());
   std::vector<int64_t> ring_pos(W, -1);
   for (int s = 0; s < W; ++s) make_kv_row(rng, &ringK[size_t(s) * HK * D], &ringV[size_t(s) * HK * D]);
   for (int p = std::max(0, pos0 - W); p < pos0; ++p) ring_pos[p % W] = p;
   if (stale) ring_pos[(pos0 + 5) % W] = pos0 + 5;  // a slot holding a position at/after the chunk start
-  std::vector<uint16_t> rk(ringK.size()), rv(ringK.size());
-  for (size_t i = 0; i < rk.size(); ++i) rk[i] = bf16_bits(ringK[i]), rv[i] = bf16_bits(ringV[i]);
+
+  const size_t elem = fp8 ? 1 : 2;
+  std::vector<uint8_t> rk(ringK.size() * elem), rv(ringV.size() * elem);
+  if (fp8) {
+    for (size_t i = 0; i < ringK.size(); ++i) {
+      rk[i] = e4m3_bits(ringK[i]), rv[i] = e4m3_bits(ringV[i]);
+      ringK[i] = e4m3_to_float(rk[i]), ringV[i] = e4m3_to_float(rv[i]);
+    }
+  } else {
+    std::vector<uint16_t> rk16(ringK.size()), rv16(ringV.size());
+    for (size_t i = 0; i < ringK.size(); ++i) rk16[i] = bf16_bits(ringK[i]), rv16[i] = bf16_bits(ringV[i]);
+    std::memcpy(rk.data(), rk16.data(), rk.size());
+    std::memcpy(rv.data(), rv16.data(), rv.size());
+  }
 
   const int L = W + T, kpos_rows = (L + 63) / 64 * 64;
   std::vector<float> K(size_t(L) * HK * D), V(K.size());
@@ -181,23 +193,33 @@ bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
     std::copy_n(&ringV[size_t(slot) * HK * D], HK * D, &V[size_t(i) * HK * D]);
     kpos[i] = int(ring_pos[slot]);
   }
-  std::vector<uint16_t> rows_k(size_t(L) * HK * D, 0), rows_v(rows_k.size(), 0);
+  std::vector<uint8_t> rows_k(size_t(L) * HK * D * elem, 0), rows_v(rows_k.size(), 0);
   for (int t = 0; t < T; ++t) {
     float* k = &K[size_t(W + t) * HK * D];
     float* v = &V[size_t(W + t) * HK * D];
     make_kv_row(rng, k, v);
-    for (int c = 0; c < HK * D; ++c)
-      rows_k[size_t(W + t) * HK * D + c] = bf16_bits(k[c]), rows_v[size_t(W + t) * HK * D + c] = bf16_bits(v[c]);
+    if (fp8) {
+      for (int c = 0; c < HK * D; ++c) {
+        const uint8_t ek = e4m3_bits(k[c]), ev = e4m3_bits(v[c]);
+        rows_k[size_t(W + t) * HK * D + c] = ek;
+        rows_v[size_t(W + t) * HK * D + c] = ev;
+        k[c] = e4m3_to_float(ek), v[c] = e4m3_to_float(ev);
+      }
+    } else {
+      for (int c = 0; c < HK * D; ++c) {
+        const uint16_t bk = bf16_bits(k[c]), bv = bf16_bits(v[c]);
+        std::memcpy(&rows_k[(size_t(W + t) * HK * D + c) * 2], &bk, 2);
+        std::memcpy(&rows_v[(size_t(W + t) * HK * D + c) * 2], &bv, 2);
+      }
+    }
     kpos[W + t] = pos0 + t;
   }
-  DeviceArray<uint16_t> ring_k(rk), ring_v(rv), kr(rows_k), vr(rows_v);
+  DeviceArray<uint8_t> ring_k(rk), ring_v(rv), kr(rows_k), vr(rows_v);
   DeviceArray<int64_t> rpos(ring_pos);
   DeviceArray<int> kp(kpos_rows);
   DeviceArray<int4> bounds(kpos_rows / 64);
-  pk::ring_gather(reinterpret_cast<const __nv_bfloat16*>(ring_k.get()),
-                  reinterpret_cast<const __nv_bfloat16*>(ring_v.get()), rpos.get(), pos0, T,
-                  reinterpret_cast<__nv_bfloat16*>(kr.get()), reinterpret_cast<__nv_bfloat16*>(vr.get()), kp.get(),
-                  kpos_rows, nullptr);
+  pk::ring_gather(ring_k.get(), ring_v.get(), rpos.get(), pos0, T, kr.get(), vr.get(), kp.get(), kpos_rows, fp8,
+                  nullptr);
   pk::key_tile_bounds(kp.get(), L, bounds.get(), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   bool ok = true;
@@ -206,18 +228,26 @@ bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
     const auto gr = kr.download();
     size_t bad = 0;
     for (int i = 0; i < kpos_rows; ++i) bad += gk[i] != (i < L ? kpos[i] : -1);
-    for (size_t i = 0; i < size_t(W) * HK * D; ++i) bad += gr[i] != bf16_bits(K[i]);
-    std::printf("%s ring_gather rows/positions: %zu mismatches\n", bad ? "FAIL" : "PASS", bad);
+    for (size_t i = 0; i < size_t(W) * HK * D; ++i) {
+      if (fp8) {  // a byte copy of the ring slot (re-encoding K would turn -0 codes into +0)
+        const size_t row = i / (size_t(HK) * D), col = i % (size_t(HK) * D);
+        bad += gr[i] != rk[size_t((pos0 + int(row)) % W) * HK * D + col];
+      } else {
+        uint16_t h = 0;
+        std::memcpy(&h, &gr[i * 2], 2);
+        bad += h != bf16_bits(K[i]);
+      }
+    }
+    std::printf("%s ring_gather (%s) rows/positions: %zu mismatches\n", bad ? "FAIL" : "PASS",
+                fp8 ? "fp8" : "bf16", bad);
     ok &= bad == 0;
   }
   const Inputs in = make_inputs(rng, T, pos0);
   char name[96];
-  std::snprintf(name, sizeof name, "sliding pos0=%d T=%d%s", pos0, T, stale ? " stale" : "");
-  ok &= run_attention(name, in, kr.get(), vr.get(), false, kp.get(), bounds.get(), L, W, K, V, kpos, stride);
+  std::snprintf(name, sizeof name, "sliding %s pos0=%d T=%d%s", fp8 ? "fp8" : "bf16", pos0, T, stale ? " stale" : "");
+  ok &= run_attention(name, in, kr.get(), vr.get(), fp8, kp.get(), bounds.get(), L, W, K, V, kpos, stride);
 
-  pk::ring_update(reinterpret_cast<const __nv_bfloat16*>(kr.get()), reinterpret_cast<const __nv_bfloat16*>(vr.get()),
-                  pos0, T, reinterpret_cast<__nv_bfloat16*>(ring_k.get()),
-                  reinterpret_cast<__nv_bfloat16*>(ring_v.get()), rpos.get(), nullptr);
+  pk::ring_update(kr.get(), vr.get(), pos0, T, ring_k.get(), ring_v.get(), rpos.get(), fp8, nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   {
     auto exp_pos = ring_pos;
@@ -226,14 +256,14 @@ bool sliding_case(Rng& rng, int pos0, int T, bool stale, int stride) {
     for (int c = T - n; c < T; ++c) {
       const int slot = (pos0 + c) % W;
       exp_pos[slot] = pos0 + c;
-      std::copy_n(&rows_k[size_t(W + c) * HK * D], HK * D, &exp_k[size_t(slot) * HK * D]);
+      std::copy_n(&rows_k[size_t(W + c) * HK * D * elem], HK * D * elem, &exp_k[size_t(slot) * HK * D * elem]);
     }
     const auto gp = rpos.download();
     const auto gk = ring_k.download();
     size_t bad = 0;
     for (int s = 0; s < W; ++s) bad += gp[s] != exp_pos[s];
     for (size_t i = 0; i < exp_k.size(); ++i) bad += gk[i] != exp_k[i];
-    std::printf("%s ring_update: %zu mismatches\n", bad ? "FAIL" : "PASS", bad);
+    std::printf("%s ring_update (%s): %zu mismatches\n", bad ? "FAIL" : "PASS", fp8 ? "fp8" : "bf16", bad);
     ok &= bad == 0;
   }
   return ok;
@@ -255,6 +285,10 @@ int main() {
   ok &= sliding_case(rng, 700, 300, false, 3);
   ok &= sliding_case(rng, 5000, 1100, true, 7);
   ok &= sliding_case(rng, 5000, 4096, true, 1);
+  ok &= sliding_case(rng, 0, 50, false, 1, true);
+  ok &= sliding_case(rng, 700, 300, false, 3, true);
+  ok &= sliding_case(rng, 5000, 1100, true, 7, true);
+  ok &= sliding_case(rng, 5000, 4096, true, 1, true);
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;
 }

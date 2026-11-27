@@ -19,24 +19,25 @@ fi
 
 case "$profile" in
   # 32k/128k/256k are the measured RTX 5080 recipes in benchmarks/rtx5080/long-context.
-  32k) capacity=32768; width=2048; precision=v4; overlap=1; stage=64; elastic=1; experts=rtx5080-experts-12.4.json ;;
+  32k) capacity=32768; width=2048; precision=v4; overlap=0; stage=0; elastic=1; experts="" ;;
   64k) capacity=65536; width=2048; precision=fp8; overlap=0; stage=256; elastic=0; experts=rtx5080-experts.json ;;
-  128k) capacity=131072; width=2048; precision=k4; overlap=1; stage=128; elastic=0; experts=rtx5080-experts-11.2.json ;;
-  256k) capacity=262144; width=2048; precision=k4; overlap=1; stage=128; elastic=0; experts=rtx5080-experts-10.0.json ;;
+  128k) capacity=131072; width=2048; precision=k4; overlap=1; stage=128; elastic=0; experts=rtx5080-experts-128k-p3.json ;;
+  256k) capacity=262144; width=2048; precision=k4; overlap=1; stage=128; elastic=0; experts=rtx5080-experts-256k-p3.json ;;
   *) echo 'TWINKLING_PROFILE must be 32k, 64k, 128k, or 256k.' >&2; exit 2 ;;
 esac
-plan="${TWINKLING_EXPERT_PLAN:-$root/config/$experts}"
+plan="${TWINKLING_EXPERT_PLAN:-${experts:+$root/config/$experts}}"
 ctx="${TWINKLING_CONTEXT:-$capacity}"
 chunk="${TWINKLING_PREFILL_CHUNK:-$width}"
 cache="${TWINKLING_KV:-$precision}"
 
-[[ -x "$server" && -r "$plan" && -r "$model/model.safetensors.index.json" ]] || {
+[[ -x "$server" && ( -z "$plan" || -r "$plan" ) && -r "$model/model.safetensors.index.json" ]] || {
   echo 'The server, converted model or expert plan is missing. Run scripts/setup-5080.sh first.' >&2
   exit 1
 }
 args=(--engine --model-dir "$model" --host 127.0.0.1 --port "$port" --max-ctx "$ctx"
       --dense-fp8 --spec --spec-threshold 0.8 --no-vision --park-mb 0 --embed-host
-      --prefill-chunk "$chunk" --prefill-stage-mib "$stage" --expert-plan "$plan" --max-queue 8)
+      --prefill-chunk "$chunk" --prefill-stage-mib "$stage" --max-queue 8)
+if [[ -n "$plan" ]]; then args+=(--expert-plan "$plan"); fi
 case "$cache" in
   fp8) args+=(--kv-fp8) ;;
   v4) args+=(--kv-v4) ;;

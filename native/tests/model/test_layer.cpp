@@ -5,6 +5,7 @@
 
 #include "core/safetensors.h"
 #include "kernels/dense/dense.h"
+#include "kernels/moe/scale6.cuh"
 #include "model/runtime.h"
 
 #include <cuda_runtime.h>
@@ -53,7 +54,9 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
     ok &= c;
   };
   expect(layer.full == is_full_layer(l) && layer.loop == is_loop_layer(l), "flags");
-  expect(layer.experts.fmt == (l < 20 ? ExpertFormat::NVFP4 : ExpertFormat::MXFP8), "expert format");
+  // NVFP4 codes are U8 in the checkpoint (TWinkling's 5080 conversion turns layers 20-23 into NVFP4 too).
+  const bool nv_ckpt = m.at(p + "mlp.experts.w13_weight")->dtype == "U8";
+  expect(layer.experts.fmt == (nv_ckpt ? ExpertFormat::NVFP4 : ExpertFormat::MXFP8), "expert format");
   const int R = proj_rows(layer.full), H = HIDDEN;
   expect(layer.wproj.fp8() && layer.wproj.rows() == R && layer.wproj.cols() == H, "wproj shape");
   expect(layer.wo.fp8() && layer.wo.rows() == H && layer.wo.cols() == 3072, "wo shape");
@@ -93,7 +96,8 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
     const auto have = download<float>(t.data, want.size());
     expect(t.numel() == std::int64_t(want.size()) && have == want, name + " (fp32)");
   };
-  same_f32(layer.router, p + "mlp.gate.weight");
+  // The FP32 router copy is not kept (VRAM reclaim); router_bf16 holds the exact values, checked below.
+  expect(layer.router.data == nullptr, "no FP32 router copy");
   same_f32(layer.router_bias, p + "mlp.gate.bias");
   same_f32(layer.mlp_query, "model.llm.attn_res.mlp_queries." + std::to_string(l));
   same_f32(layer.attn_query, "model.llm.attn_res.attn_queries." + std::to_string(l - 1));
@@ -118,8 +122,17 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
     expect(eq, "router_bf16 holds the checkpoint values");
   }
   if (layer.loop) {
-    same_f32(layer.k_gate_forget, p + "controllers.k.forget_weight");
-    same_f32(layer.mlp_gate_gain, p + "controllers.mlp.gain_weight");
+    // Controllers are held as BF16 copies (VRAM reclaim): [q, k, v] stacks and the MLP gate.
+    auto same_bf16 = [&](const void* data, const std::string& name) {
+      const auto want = host_values(m, name);
+      const auto have = download<__nv_bfloat16>(data, want.size());
+      bool eq = true;
+      for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == want[i];
+      expect(eq, name + " (bf16 copy)");
+    };
+    same_bf16(static_cast<const char*>(layer.qkv_gate_forget16.data) + std::size_t(H) * 64 * 2,
+              p + "controllers.k.forget_weight");
+    same_bf16(layer.mlp1_gate_gain16.data, p + "controllers.mlp.gain_weight");
     const auto want = host_values(m, p + "controllers.v.down_weight");
     const auto have = download<__nv_bfloat16>(layer.v_gate_down.data, want.size());
     bool eq = true;
@@ -127,12 +140,24 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
     expect(eq && layer.v_gate_down.data == static_cast<char*>(layer.qkv_gate_down.data) + std::size_t(2) * 64 * 2 * H * 2,
            "v_gate_down is gate 2 of the qkv stack");
   }
-  // experts: raw bytes, NVFP4 factors = amax / denominator
+  // experts: raw bytes (or lossless 6-bit packed when w2_scale_base >= 0), NVFP4 factors = amax / denominator
   {
     const auto ref = m.at(p + "mlp.experts.w2_weight_scale");
     const auto raw = m.read(p + "mlp.experts.w2_weight_scale");
-    const auto have = download<std::uint8_t>(layer.experts.w2_scale.data, raw.size());
-    expect(std::memcmp(have.data(), raw.data(), raw.size()) == 0 && ref->bytes == raw.size(), "w2 scales");
+    if (layer.experts.w2_scale_base >= 0) {
+      const std::size_t packed_words = (raw.size() / 16) * 3;
+      const auto packed = download<std::uint32_t>(layer.experts.w2_scale.data, packed_words + 1);
+      std::vector<std::uint8_t> unpacked(raw.size());
+      for (std::size_t g = 0; g < raw.size() / 16; ++g)
+        kernels::moe::unpack16_6bit(packed.data() + g * 3, unpacked.data() + g * 16,
+                                    std::uint8_t(layer.experts.w2_scale_base));
+      expect(layer.experts.w2_scale.bytes() == packed_words * sizeof(std::uint32_t) &&
+                 std::memcmp(unpacked.data(), raw.data(), raw.size()) == 0 && ref->bytes == raw.size(),
+             "w2 scales packed6");
+    } else {
+      const auto have = download<std::uint8_t>(layer.experts.w2_scale.data, raw.size());
+      expect(std::memcmp(have.data(), raw.data(), raw.size()) == 0 && ref->bytes == raw.size(), "w2 scales");
+    }
     if (layer.experts.fmt == ExpertFormat::NVFP4) {
       const auto amax = host_values(m, p + "mlp.experts.w13_weight_amax");
       const auto den = host_values(m, p + "mlp.experts.w13_weight_outer_scale_denominator");

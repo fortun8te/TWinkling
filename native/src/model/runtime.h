@@ -70,6 +70,9 @@ class Decoder {
   // With expert_routes, the router outputs use one [NUM_VISITS, m, TOP_K] device buffer.
   void decode(Buffers& b, const std::int64_t* pos, bool history, cudaStream_t stream, int* expert_routes = nullptr);
 
+  void* lend_table() { return lend_table_.p; }
+  int* lend_active() { return static_cast<int*>(lend_active_.p); }
+
  private:
   const std::int64_t* block_table(const std::vector<const float*>& blocks);
 
@@ -78,6 +81,8 @@ class Decoder {
   State& st_;
   bool pdl_;
   DeviceBuffer attn_ws_;  // attn workspace for up to 8 rows (zeroed once)
+  DeviceBuffer lend_table_;   // kernels::moe::ExpertLend[LAYERS]
+  DeviceBuffer lend_active_;  // int32[1]: 1 while Prefiller arena holds lent cold experts
   std::map<std::vector<const float*>, DeviceBuffer> tables_;  // device pointer tables for mix
   std::array<DeviceBuffer, 2> segments_;  // proj segment tables: [single-input sliding, three-input]
   DeviceBuffer full_segments_;
@@ -193,7 +198,19 @@ class Runtime {
   void stage_expert_routes();
   void count_expert_routes(int width, int committed, ExpertRouteStats& totals) const;
 
+  // Prefiller arena lending: reuse the idle prefill scratch + staging arena during decode to cache extra
+  // cold experts in VRAM (0 extra VRAM, bit-identical, CUDA-graph safe).
+  void setup_prefill_lend(void* arena, std::size_t arena_bytes);
+  void populate_prefill_lend();
+  void vacate_prefill_lend();
+
  private:
+  struct LendCopy {
+    void* dst = nullptr;
+    const void* src = nullptr;
+    std::size_t bytes = 0;
+    bool pad_zero = false;
+  };
   void init();
   void capture(int m, bool history);
   StatePtrs state_ptrs() const;
@@ -221,6 +238,8 @@ class Runtime {
   DeviceBuffer expert_routes_;
   std::unique_ptr<PinnedHostBuffer> expert_routes_host_;
   std::vector<std::array<std::size_t, EXPERTS>> expert_host_bytes_;
+  std::vector<LendCopy> lend_copies_;
+  bool lend_populated_ = false;
 };
 
 // The Generator (make_generator) over given weights and ablation, for tests: plain decoding only

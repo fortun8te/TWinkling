@@ -22,7 +22,7 @@ struct DecodeArgs {
   const float* v_conv = nullptr;
   float* conv_k_state = nullptr;    // fp32 [3, 1024]
   float* conv_v_state = nullptr;
-  void* k_cache = nullptr;          // [rows, 8, 128] bf16, or float8_e4m3fn (full layers only)
+  void* k_cache = nullptr;          // [rows, 8, 128] bf16, or float8_e4m3fn
   void* v_cache = nullptr;
   bool cache_fp8 = false;
   bool cache_v4 = false;  // only when cache_fp8 and window == 0

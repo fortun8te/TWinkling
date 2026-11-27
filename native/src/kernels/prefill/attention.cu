@@ -339,13 +339,15 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
       rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(0xffffffffu, rmax[r], 1));
       rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(0xffffffffu, rmax[r], 2));
       mref[r] = rmax[r] == -INFINITY ? 0.f : rmax[r];
-      const float alpha = exp2f(m[r] - mref[r]);
-      m[r] = rmax[r];
-      l[r] *= alpha;
+      if (rmax[r] != m[r] || !isfinite(m[r])) {
+        const float alpha = exp2f(m[r] - mref[r]);
+        m[r] = rmax[r];
+        l[r] *= alpha;
 #pragma unroll
-      for (int dt = 0; dt < D / 8; ++dt) {
-        o[dt][2 * r] *= alpha;
-        o[dt][2 * r + 1] *= alpha;
+        for (int dt = 0; dt < D / 8; ++dt) {
+          o[dt][2 * r] *= alpha;
+          o[dt][2 * r + 1] *= alpha;
+        }
       }
     }
 #pragma unroll
@@ -646,13 +648,15 @@ __global__ void __launch_bounds__(NT, 1) attn_fp8_mma_kernel(const AttnParams p)
       rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(0xffffffffu, rmax[r], 1));
       rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(0xffffffffu, rmax[r], 2));
       mref[r] = rmax[r] == -INFINITY ? 0.f : rmax[r];
-      const float alpha = exp2f(m[r] - mref[r]);
-      m[r] = rmax[r];
-      l[r] *= alpha;
+      if (rmax[r] != m[r] || !isfinite(m[r])) {
+        const float alpha = exp2f(m[r] - mref[r]);
+        m[r] = rmax[r];
+        l[r] *= alpha;
 #pragma unroll
-      for (int dt = 0; dt < D / 8; ++dt) {
-        o[dt][2 * r] *= alpha;
-        o[dt][2 * r + 1] *= alpha;
+        for (int dt = 0; dt < D / 8; ++dt) {
+          o[dt][2 * r] *= alpha;
+          o[dt][2 * r + 1] *= alpha;
+        }
       }
     }
 #pragma unroll
@@ -738,26 +742,29 @@ bool fp8_mma_enabled() {
 
 // ---- sliding-visit key rows
 
-constexpr int kRowVecs = kKvDim * 2 / 16;  // 16-byte vectors per key row (128)
+constexpr int kRowVecsBf16 = kKvDim * 2 / 16;  // 16-byte vectors per BF16 key row (128)
+constexpr int kRowVecsFp8 = kKvDim / 16;       // 16-byte vectors per FP8 key row (64)
 
+template <int RowVecs>
 __global__ void ring_gather_kernel(const uint4* __restrict__ k_ring, const uint4* __restrict__ v_ring,
                                    const int64_t* __restrict__ ring_pos, int pos0, int T, uint4* __restrict__ k_rows,
                                    uint4* __restrict__ v_rows, int* __restrict__ kpos, int kpos_rows) {
   const int i = blockIdx.x, slot = (pos0 + i) & (kRelExtent - 1);
-  k_rows[size_t(i) * kRowVecs + threadIdx.x] = k_ring[size_t(slot) * kRowVecs + threadIdx.x];
-  v_rows[size_t(i) * kRowVecs + threadIdx.x] = v_ring[size_t(slot) * kRowVecs + threadIdx.x];
+  k_rows[size_t(i) * RowVecs + threadIdx.x] = k_ring[size_t(slot) * RowVecs + threadIdx.x];
+  v_rows[size_t(i) * RowVecs + threadIdx.x] = v_ring[size_t(slot) * RowVecs + threadIdx.x];
   if (threadIdx.x == 0) kpos[i] = int(ring_pos[slot]);
-  for (int r = kRelExtent + i * kRowVecs + threadIdx.x; r < kpos_rows; r += gridDim.x * kRowVecs)
+  for (int r = kRelExtent + i * RowVecs + threadIdx.x; r < kpos_rows; r += gridDim.x * RowVecs)
     kpos[r] = r - kRelExtent < T ? pos0 + r - kRelExtent : -1;
 }
 
+template <int RowVecs>
 __global__ void ring_update_kernel(const uint4* __restrict__ k_rows, const uint4* __restrict__ v_rows, int pos0, int T,
                                    uint4* __restrict__ k_ring, uint4* __restrict__ v_ring, int64_t* __restrict__ ring_pos) {
   const int n = min(T, kRelExtent);
   const int c = T - n + blockIdx.x;  // chunk row
   const int pos = pos0 + c, slot = pos & (kRelExtent - 1);
-  k_ring[size_t(slot) * kRowVecs + threadIdx.x] = k_rows[size_t(kRelExtent + c) * kRowVecs + threadIdx.x];
-  v_ring[size_t(slot) * kRowVecs + threadIdx.x] = v_rows[size_t(kRelExtent + c) * kRowVecs + threadIdx.x];
+  k_ring[size_t(slot) * RowVecs + threadIdx.x] = k_rows[size_t(kRelExtent + c) * RowVecs + threadIdx.x];
+  v_ring[size_t(slot) * RowVecs + threadIdx.x] = v_rows[size_t(kRelExtent + c) * RowVecs + threadIdx.x];
   if (threadIdx.x == 0) ring_pos[slot] = pos;
 }
 
@@ -812,18 +819,40 @@ void attention(const AttnParams& p, cudaStream_t stream) {
   }
 }
 
+void ring_gather(const void* k_ring, const void* v_ring, const int64_t* ring_pos, int pos0, int T, void* k_rows,
+                 void* v_rows, int* kpos, int kpos_rows, bool fp8, cudaStream_t stream) {
+  if (fp8) {
+    ring_gather_kernel<kRowVecsFp8><<<kRelExtent, kRowVecsFp8, 0, stream>>>(
+        static_cast<const uint4*>(k_ring), static_cast<const uint4*>(v_ring), ring_pos, pos0, T,
+        static_cast<uint4*>(k_rows), static_cast<uint4*>(v_rows), kpos, kpos_rows);
+  } else {
+    ring_gather_kernel<kRowVecsBf16><<<kRelExtent, kRowVecsBf16, 0, stream>>>(
+        static_cast<const uint4*>(k_ring), static_cast<const uint4*>(v_ring), ring_pos, pos0, T,
+        static_cast<uint4*>(k_rows), static_cast<uint4*>(v_rows), kpos, kpos_rows);
+  }
+}
+
 void ring_gather(const __nv_bfloat16* k_ring, const __nv_bfloat16* v_ring, const int64_t* ring_pos, int pos0, int T,
                  __nv_bfloat16* k_rows, __nv_bfloat16* v_rows, int* kpos, int kpos_rows, cudaStream_t stream) {
-  ring_gather_kernel<<<kRelExtent, kRowVecs, 0, stream>>>(
-      reinterpret_cast<const uint4*>(k_ring), reinterpret_cast<const uint4*>(v_ring), ring_pos, pos0, T,
-      reinterpret_cast<uint4*>(k_rows), reinterpret_cast<uint4*>(v_rows), kpos, kpos_rows);
+  ring_gather(k_ring, v_ring, ring_pos, pos0, T, k_rows, v_rows, kpos, kpos_rows, false, stream);
+}
+
+void ring_update(const void* k_rows, const void* v_rows, int pos0, int T, void* k_ring, void* v_ring,
+                 int64_t* ring_pos, bool fp8, cudaStream_t stream) {
+  if (fp8) {
+    ring_update_kernel<kRowVecsFp8><<<std::min(T, kRelExtent), kRowVecsFp8, 0, stream>>>(
+        static_cast<const uint4*>(k_rows), static_cast<const uint4*>(v_rows), pos0, T,
+        static_cast<uint4*>(k_ring), static_cast<uint4*>(v_ring), ring_pos);
+  } else {
+    ring_update_kernel<kRowVecsBf16><<<std::min(T, kRelExtent), kRowVecsBf16, 0, stream>>>(
+        static_cast<const uint4*>(k_rows), static_cast<const uint4*>(v_rows), pos0, T,
+        static_cast<uint4*>(k_ring), static_cast<uint4*>(v_ring), ring_pos);
+  }
 }
 
 void ring_update(const __nv_bfloat16* k_rows, const __nv_bfloat16* v_rows, int pos0, int T, __nv_bfloat16* k_ring,
                  __nv_bfloat16* v_ring, int64_t* ring_pos, cudaStream_t stream) {
-  ring_update_kernel<<<std::min(T, kRelExtent), kRowVecs, 0, stream>>>(
-      reinterpret_cast<const uint4*>(k_rows), reinterpret_cast<const uint4*>(v_rows), pos0, T,
-      reinterpret_cast<uint4*>(k_ring), reinterpret_cast<uint4*>(v_ring), ring_pos);
+  ring_update(k_rows, v_rows, pos0, T, k_ring, v_ring, ring_pos, false, stream);
 }
 
 void key_tile_bounds(const int* kpos, int L, int4* bounds, cudaStream_t stream) {

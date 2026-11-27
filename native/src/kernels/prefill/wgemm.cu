@@ -15,6 +15,7 @@
 // Epilogues: gate/up (w13 rows interleaved, 2i gate and 2i + 1 up, so each thread holds gate and up of the same
 // i): act = bf16(softcap(bf16 g, 4) * sigmoid(bf16 g) * softcap(bf16 u, 25)); down: bf16 per pair placed at
 // t * 8 + slot (moe_combine sums the slots in order: deterministic).
+#include "kernels/moe/scale6.cuh"
 #include "kernels/prefill/common.cuh"
 #include "kernels/prefill/prefill.h"
 
@@ -69,6 +70,7 @@ struct GemmArgs {
   int stage_first = 0, stage_n = 0;  // experts read from the staged copies (RTX 5080 port)
   const uint8_t* stage_codes = nullptr;
   const uint8_t* stage_scales = nullptr;
+  int scale_base = -1;
 };
 
 __device__ __forceinline__ void cp_async4(void* smem_dst, const void* gmem_src) {
@@ -159,8 +161,25 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   };
 
   // the tile's block scales, with the first activation group
-  for (int id = tid; id < C::SC_BYTES / 4; id += NT)
-    cp_async4(sc_smem + id * 4, scale_tile + (id * 4 / C::SCALE_ROW) * int64_t(C::SCALE_ROW) + (id * 4) % C::SCALE_ROW);
+  if constexpr (FMT == FMT_NVFP4) {
+    if (g.scale_base >= 0) {
+      const uint32_t* ws32 = reinterpret_cast<const uint32_t*>(staged ? g.stage_scales : g.scales);
+      const uint8_t sbase = uint8_t(g.scale_base);
+      for (int id = tid; id < C::SC_BYTES / 4; id += NT) {
+        const int byte_off = id * 4;
+        const int row = byte_off / C::SCALE_ROW, col = byte_off % C::SCALE_ROW;
+        const uint64_t sidx = (uint64_t(ee) * NE + n0 + row) * C::SCALE_ROW + col;
+        reinterpret_cast<uint32_t*>(sc_smem)[id] = kernels::moe::unpack4_6bit(ws32, sidx, sbase);
+      }
+    } else {
+      for (int id = tid; id < C::SC_BYTES / 4; id += NT)
+        cp_async4(sc_smem + id * 4,
+                  scale_tile + (id * 4 / C::SCALE_ROW) * int64_t(C::SCALE_ROW) + (id * 4) % C::SCALE_ROW);
+    }
+  } else {
+    for (int id = tid; id < C::SC_BYTES / 4; id += NT)
+      cp_async4(sc_smem + id * 4, scale_tile + (id * 4 / C::SCALE_ROW) * int64_t(C::SCALE_ROW) + (id * 4) % C::SCALE_ROW);
+  }
 #pragma unroll
   for (int j = 0; j < C::WS - 1; ++j)
     if (j < C::KC) load_w(j);
@@ -473,11 +492,15 @@ struct Nvfp4GemmArgs {
   const uint8_t* xq = nullptr;
   const uint8_t* xscale = nullptr;
   const float* xouter = nullptr;
+  float xouter_const = 0.f;
   MoeWork w;
   uint16_t* out = nullptr;
+  uint8_t* out_xq = nullptr;
+  uint8_t* out_xscale = nullptr;
   int stage_first = 0, stage_n = 0;
   const uint8_t* stage_codes = nullptr;
   const uint8_t* stage_scales = nullptr;
+  int scale_base = -1;
 };
 
 template <Mode MODE, int K>
@@ -532,7 +555,9 @@ __global__ void __launch_bounds__(256, 2) wgemm_nvfp4_kernel(const Nvfp4GemmArgs
   }
   const uint8_t* sc_src = tid < kTileN ? scale_base + size_t(tid) * kScaleRowB
                                        : g.xscale + size_t(input_of(tid - kTileN)) * kScaleRowB;
-  if (tid < kTileT) pair_outer[tid] = g.xouter[input_of(tid)];
+  if (tid < kTileT) pair_outer[tid] = g.xouter ? g.xouter[input_of(tid)] : g.xouter_const;
+  const uint32_t* ws32 = reinterpret_cast<const uint32_t*>(staged ? g.stage_scales : g.scales);
+  const int w_scale_base = g.scale_base;
 
   auto load_stage = [&](int index, int stage) {
     uint8_t* base = smem + stage * kStageBytes;
@@ -540,7 +565,15 @@ __global__ void __launch_bounds__(256, 2) wgemm_nvfp4_kernel(const Nvfp4GemmArgs
     if ((step & 1) == 0) {
       const int piece = step >> 1;
       uint8_t* dst = slots + ((step >> 2) % kSlots) * (kRows * kSlotRow) + tid * kSlotRow + ((step & 3) >> 1) * 8;
-      cp_async8(dst, sc_src + piece * 8);
+      if (w_scale_base >= 0 && tid < kTileN) {
+        const uint64_t sidx = (uint64_t(ee) * NE + n0 + tid) * kScaleRowB + piece * 8;
+        const uint8_t sbase = uint8_t(w_scale_base);
+        const uint32_t lo4 = kernels::moe::unpack4_6bit(ws32, sidx, sbase);
+        const uint32_t hi4 = kernels::moe::unpack4_6bit(ws32, sidx + 4, sbase);
+        *reinterpret_cast<uint2*>(dst) = make_uint2(lo4, hi4);
+      } else {
+        cp_async8(dst, sc_src + piece * 8);
+      }
     }
     const int offset = index * kRowBytes;
 #pragma unroll
@@ -660,6 +693,52 @@ __global__ void __launch_bounds__(256, 2) wgemm_nvfp4_kernel(const Nvfp4GemmArgs
   }
   __syncthreads();
 
+  if constexpr (MODE == Mode::Up) {
+    if (g.out_xq != nullptr) {
+      constexpr float kOuter = kFusedActOuter;
+      constexpr float kEnc = 1.f / kOuter;
+      constexpr float kEnc6 = kEnc * (1.f / 6.f);
+      constexpr float kEnc4 = kEnc * 0.25f;
+      constexpr float kFp32Max = 3.4028234663852886e38f;
+      for (int blk = tid; blk < count * 4; blk += 256) {
+        const int pair = blk >> 2, b = blk & 3;
+        const uint4* src4 = reinterpret_cast<const uint4*>(staged_out + pair * kOutStride + b * 32);
+        float v[16];
+        float bmax = 0.f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const uint4 u = src4[q];
+          const uint32_t words[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const float gt = bf_lo(words[i]), up = bf_hi(words[i]);
+            const float sig = 1.f / (1.f + expf(-gt));
+            const float a = round_bf16(__fmul_rn(__fmul_rn(softcap(gt, 4.f), sig), softcap(up, 25.f)));
+            v[4 * q + i] = a;
+            bmax = fmaxf(bmax, fabsf(a));
+          }
+        }
+        uint2 codes = make_uint2(0, 0);
+        uint8_t sbyte = 0;
+        if (bmax > 0.f) {
+          const float scale6 = e4m3_round(fminf(__fmul_rn(bmax, kEnc6), 448.f));
+          const float scale4 = e4m3_round(fminf(__fmul_rn(bmax, kEnc4), 448.f));
+          const float inv6 = scale6 > 0.f ? fminf(__fdiv_rn(1.f, __fmul_rn(scale6, kOuter)), kFp32Max) : 0.f;
+          const float inv4 = scale4 > 0.f ? fminf(__fdiv_rn(1.f, __fmul_rn(scale4, kOuter)), kFp32Max) : 0.f;
+          uint2 p6, p4;
+          const float e6 = fp4_candidate(v, scale6, inv6, kOuter, p6);
+          const float e4 = fp4_candidate(v, scale4, inv4, kOuter, p4);
+          const bool choose4 = e4 < e6;
+          const __nv_fp8_e4m3 sc(choose4 ? scale4 : scale6);
+          sbyte = sc.__x;
+          codes = choose4 ? p4 : p6;
+        }
+        *reinterpret_cast<uint2*>(g.out_xq + size_t(pb + pair) * (kInter / 2) + (n0 / 4) + b * 8) = codes;
+        g.out_xscale[size_t(pb + pair) * (kInter / 16) + (n0 / 32) + b] = sbyte;
+      }
+      return;
+    }
+  }
   for (int unit = tid; unit < count * (kTileN / 8); unit += 256) {
     const int pair = unit / (kTileN / 8);
     const int part = unit % (kTileN / 8);
@@ -698,9 +777,21 @@ bool w4a4_enabled() {
   return on;
 }
 
+bool fused_actq_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("INGINE_PREFILL_FUSED_ACTQ");
+    return !e || std::atoi(e) != 0;
+  }();
+  return on;
+}
+
 }  // namespace nvfp4_tc
 
 }  // namespace
+
+bool moe_fused_actq_active(int fmt, int T) {
+  return fmt == 0 && T >= 64 && nvfp4_tc::w4a4_enabled() && nvfp4_tc::fused_actq_enabled();
+}
 
 void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWork& w, __nv_bfloat16* act,
                  cudaStream_t stream, const MoeQuantScratch* qscratch) {
@@ -714,18 +805,25 @@ void moe_gate_up(const MoeExperts& e, const __nv_bfloat16* x, int T, const MoeWo
     g.xq = qscratch->xq;
     g.xscale = qscratch->xscale;
     g.xouter = qscratch->xouter;
+    g.xouter_const = qscratch->xouter_const;
     g.w = w;
     g.out = reinterpret_cast<uint16_t*>(act);
+    if (nvfp4_tc::fused_actq_enabled()) {
+      g.out_xq = qscratch->out_xq;
+      g.out_xscale = qscratch->out_xscale;
+    }
     g.stage_first = e.stage_first;
     g.stage_n = e.stage_n;
     g.stage_codes = static_cast<const uint8_t*>(e.stage_w13);
     g.stage_scales = static_cast<const uint8_t*>(e.stage_w13_scale);
+    g.scale_base = e.w13_scale_base;
     nvfp4_tc::launch_nvfp4<Mode::Up, kHidden>(g, (2 * kInter / TN) * moe_max_tiles(T), stream);
     return;
   }
   GemmArgs g = expert_args(e.w13, e.w13_scale, e.w13_factor, x, w, act);
   g.stage_first = e.stage_first, g.stage_n = e.stage_n;
   g.stage_codes = static_cast<const uint8_t*>(e.stage_w13), g.stage_scales = static_cast<const uint8_t*>(e.stage_w13_scale);
+  g.scale_base = e.w13_scale_base;
   if (e.fmt == 0) launch_rows<FMT_NVFP4, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
   else launch_rows<FMT_MXFP8, Mode::Up, kHidden>(g, moe_tile_rows(T), 2 * kInter / TN, moe_max_tiles(T), stream);
 }
@@ -734,8 +832,10 @@ void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWor
               cudaStream_t stream, const MoeQuantScratch* qscratch) {
   if (e.fmt == 0 && qscratch && qscratch->xq && T >= 64 && nvfp4_tc::w4a4_enabled()) {
     const int pairs = T * kTopK;
-    nvfp4_tc::quantize_nvfp4_kernel<<<(pairs + 7) / 8, 256, 0, stream>>>(
-        act, pairs, kInter, qscratch->xq, qscratch->xscale, qscratch->xouter);
+    if (!qscratch->prequantized) {
+      nvfp4_tc::quantize_nvfp4_kernel<<<(pairs + 7) / 8, 256, 0, stream>>>(
+          act, pairs, kInter, qscratch->xq, qscratch->xscale, qscratch->xouter);
+    }
     nvfp4_tc::Nvfp4GemmArgs g;
     g.codes = static_cast<const uint8_t*>(e.w2);
     g.scales = static_cast<const uint8_t*>(e.w2_scale);
@@ -743,18 +843,21 @@ void moe_down(const MoeExperts& e, const __nv_bfloat16* act, int T, const MoeWor
     g.xq = qscratch->xq;
     g.xscale = qscratch->xscale;
     g.xouter = qscratch->xouter;
+    g.xouter_const = qscratch->xouter_const;
     g.w = w;
     g.out = reinterpret_cast<uint16_t*>(down);
     g.stage_first = e.stage_first;
     g.stage_n = e.stage_n;
     g.stage_codes = static_cast<const uint8_t*>(e.stage_w2);
     g.stage_scales = static_cast<const uint8_t*>(e.stage_w2_scale);
+    g.scale_base = e.w2_scale_base;
     nvfp4_tc::launch_nvfp4<Mode::Down, kInter>(g, (kHidden / TN) * moe_max_tiles(T), stream);
     return;
   }
   GemmArgs g = expert_args(e.w2, e.w2_scale, e.w2_factor, act, w, down);
   g.stage_first = e.stage_first, g.stage_n = e.stage_n;
   g.stage_codes = static_cast<const uint8_t*>(e.stage_w2), g.stage_scales = static_cast<const uint8_t*>(e.stage_w2_scale);
+  g.scale_base = e.w2_scale_base;
   if (e.fmt == 0) launch_rows<FMT_NVFP4, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
   else launch_rows<FMT_MXFP8, Mode::Down, kInter>(g, moe_tile_rows(T), kHidden / TN, moe_max_tiles(T), stream);
 }

@@ -178,6 +178,85 @@ bool test_dequant(const ExpertWeight& w) {
   return bad == 0;
 }
 
+bool test_packed_nvfp4(Rng& rng, const ExpertWeight& w13, const ExpertWeight& w2) {
+  const size_t n13 = size_t(E) * 2 * I * (H / 16);
+  const size_t n2 = size_t(E) * H * (I / 16);
+  DeviceArray<uint32_t> mm(2), ps13((n13 / 16) * 3 + 1), ps2((n2 / 16) * 3 + 1);
+  moe::nvfp4_scales_minmax(w13.scales->get(), n13, mm.get(), g_stream);
+  sync();
+  auto h13 = mm.download();
+  moe::nvfp4_scales_minmax(w2.scales->get(), n2, mm.get(), g_stream);
+  sync();
+  auto h2 = mm.download();
+  if (h13[1] - h13[0] > 63 || h2[1] - h2[0] > 63) {
+    std::printf("FAIL pack6 minmax span exceeded (%u..%u, %u..%u)\n", h13[0], h13[1], h2[0], h2[1]);
+    return false;
+  }
+  const int b13 = int(h13[0]), b2 = int(h2[0]);
+  moe::pack_nvfp4_scales_6bit(w13.scales->get(), ps13.get(), n13, uint8_t(b13), g_stream);
+  moe::pack_nvfp4_scales_6bit(w2.scales->get(), ps2.get(), n2, uint8_t(b2), g_stream);
+  sync();
+
+  bool ok = true;
+  for (int M : {1, 3, 8}) {
+    const std::vector<float> x = randn_bf16(rng, size_t(M) * H, 1.0);
+    const std::vector<int> idx = routing(rng, M);
+    DeviceArray<__nv_bfloat16> dx(to_bf16(x)), out_ref(size_t(M) * TOPK * I), out_pk(size_t(M) * TOPK * I);
+    DeviceArray<int> didx(idx);
+    moe::moe_up(dx.get(), M, didx.get(), w13.codes->get(), w13.scales->get(), w13.factor->get(),
+                moe::Format::NVFP4, out_ref.get(), true, g_stream, -1);
+    moe::moe_up(dx.get(), M, didx.get(), w13.codes->get(), ps13.get(), w13.factor->get(),
+                moe::Format::NVFP4, out_pk.get(), true, g_stream, b13);
+    sync();
+    const auto a = out_ref.download(), b = out_pk.download();
+    size_t bad = 0;
+    for (size_t i = 0; i < a.size(); ++i) bad += std::memcmp(&a[i], &b[i], sizeof(__nv_bfloat16)) != 0;
+    std::printf("%s moe_up pack6 M=%d: %zu bit mismatches\n", bad ? "FAIL" : "PASS", M, bad);
+    ok &= bad == 0;
+  }
+  for (int M : {1, 3, 8}) {
+    const std::vector<float> act = randn_bf16(rng, size_t(M) * TOPK * I, 0.5);
+    const std::vector<int> idx = routing(rng, M);
+    std::vector<float> wts(size_t(M) * TOPK);
+    for (auto& v : wts) v = float(rng.uniform(0.2, 2.0));
+    const std::vector<float> cw = randn(rng, size_t(H) * 4, 0.5);
+    const std::vector<float> st0 = randn_bf16(rng, size_t(3) * H, 0.3);
+    DeviceArray<__nv_bfloat16> dact(to_bf16(act));
+    DeviceArray<int> didx(idx);
+    DeviceArray<float> dw(wts), dcw(cw), st_ref(st0), out_ref(size_t(M) * H), hist_ref(size_t(M) * H);
+    DeviceArray<float> st_pk(st0), out_pk(size_t(M) * H), hist_pk(size_t(M) * H);
+    moe::moe_down(dact.get(), M, didx.get(), dw.get(), w2.codes->get(), w2.scales->get(), w2.factor->get(),
+                  moe::Format::NVFP4, dcw.get(), st_ref.get(), out_ref.get(), hist_ref.get(), true, g_stream, -1);
+    moe::moe_down(dact.get(), M, didx.get(), dw.get(), w2.codes->get(), ps2.get(), w2.factor->get(),
+                  moe::Format::NVFP4, dcw.get(), st_pk.get(), out_pk.get(), hist_pk.get(), true, g_stream, b2);
+    sync();
+    const auto oa = out_ref.download(), ob = out_pk.download();
+    const auto ha = hist_ref.download(), hb = hist_pk.download();
+    const auto sa = st_ref.download(), sb = st_pk.download();
+    size_t bad = 0;
+    for (size_t i = 0; i < oa.size(); ++i) bad += oa[i] != ob[i] || ha[i] != hb[i];
+    for (size_t i = 0; i < sa.size(); ++i) bad += sa[i] != sb[i];
+    std::printf("%s moe_down pack6 M=%d: %zu mismatches\n", bad ? "FAIL" : "PASS", M, bad);
+    ok &= bad == 0;
+  }
+  const std::vector<int> experts = {E - 1, 0, 3};
+  DeviceArray<int> de(experts);
+  for (const auto& [w, ps, b, tag] : {std::tuple{&w13, ps13.get(), b13, "w13"}, std::tuple{&w2, ps2.get(), b2, "w2"}}) {
+    DeviceArray<__nv_bfloat16> out(experts.size() * w->rows * w->cols);
+    moe::dequant_experts(w->codes->get(), ps, w->factor->get(), de.get(), int(experts.size()), w->rows, w->cols,
+                         moe::Format::NVFP4, out.get(), g_stream, b);
+    sync();
+    const auto got = bf16_download(out);
+    size_t bad = 0;
+    for (size_t s = 0; s < experts.size(); ++s)
+      for (size_t i = 0; i < size_t(w->rows) * w->cols; ++i)
+        bad += got[s * w->rows * w->cols + i] != w->value[size_t(experts[s]) * w->rows * w->cols + i];
+    std::printf("%s dequant_experts pack6 %s: %zu mismatches\n", bad ? "FAIL" : "PASS", tag, bad);
+    ok &= bad == 0;
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -185,16 +264,24 @@ int main() {
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
   Rng rng(1152);
   bool ok = true;
-  for (bool nv : {true, false}) {
-    const ExpertWeight w13 = make_expert_weight(rng, 2 * I, H, nv);
-    for (int M : {1, 3, 8}) ok &= test_up(rng, w13, M);
-    ok &= test_dequant(w13);
+  // Same random draw order as before the packed-scale test, so the established fixtures are unchanged.
+  const ExpertWeight w13_nv = make_expert_weight(rng, 2 * I, H, true);
+  for (int M : {1, 3, 8}) ok &= test_up(rng, w13_nv, M);
+  ok &= test_dequant(w13_nv);
+  {
+    const ExpertWeight w13_mx = make_expert_weight(rng, 2 * I, H, false);
+    for (int M : {1, 3, 8}) ok &= test_up(rng, w13_mx, M);
+    ok &= test_dequant(w13_mx);
   }
-  for (bool nv : {true, false}) {
-    const ExpertWeight w2 = make_expert_weight(rng, H, I, nv);
-    for (int M : {1, 3, 8}) ok &= test_down(rng, w2, M);
-    ok &= test_dequant(w2);
+  const ExpertWeight w2_nv = make_expert_weight(rng, H, I, true);
+  for (int M : {1, 3, 8}) ok &= test_down(rng, w2_nv, M);
+  ok &= test_dequant(w2_nv);
+  {
+    const ExpertWeight w2_mx = make_expert_weight(rng, H, I, false);
+    for (int M : {1, 3, 8}) ok &= test_down(rng, w2_mx, M);
+    ok &= test_dequant(w2_mx);
   }
+  ok &= test_packed_nvfp4(rng, w13_nv, w2_nv);
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

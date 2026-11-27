@@ -77,27 +77,32 @@ class Loader {
 
   // Routed-expert tensor [128, ...] with expert j of the result = expert order[j] of the checkpoint, the first
   // `hot` experts in VRAM, experts hot..keep-1 in pinned host memory, experts past `keep` not stored (RTX 5080
-  // port). Uploaded at flush().
+  // port). Uploaded at flush(). When every expert is hot and kept, stays in plain device memory without 2 MiB
+  // VMM padding.
   Tensor experts(const std::string& name, const std::array<int, EXPERTS>& order, int hot, int keep) {
-    if (tiered_ == nullptr) throw std::logic_error("Loader::experts: no tiered storage");
     const SafetensorsRef ref = m_.at(name);
     if (ref->shape.empty() || ref->shape[0] != EXPERTS) throw std::runtime_error("weights: " + name + " is not [128, ...]");
     const std::uint64_t eb = ref->bytes / EXPERTS;
-    tiered_->emplace_back(std::size_t(eb) * keep, std::size_t(eb) * hot);
-    auto* base = static_cast<std::byte*>(tiered_->back().data());
-    // Read in checkpoint order so adjacent experts can share a staged read. The inverse mapping
-    // keeps the original hot/cold order in the CUDA allocation, including plans that omit experts.
-    std::array<int, EXPERTS> destination;
-    destination.fill(-1);
-    for (int j = 0; j < keep; ++j) destination[order[j]] = j;
-    for (int expert = 0; expert < EXPERTS; ++expert) {
-      const int j = destination[expert];
-      if (j < 0) continue;
-      pending_.push_back(UploadRequest{ref.file, ref->offset + std::uint64_t(expert) * eb,
-                                       eb, base + std::size_t(j) * eb});
+    void* base = nullptr;
+    if (hot == EXPERTS && keep == EXPERTS) {
+      base = alloc(std::size_t(eb) * keep + 16);
+    } else {
+      if (tiered_ == nullptr) throw std::logic_error("Loader::experts: no tiered storage");
+      tiered_->emplace_back(std::size_t(eb) * keep, std::size_t(eb) * hot);
+      base = tiered_->back().data();
     }
+    queue_experts_impl(ref, order, keep, base);
     return ref->view(base);
   }
+
+  // Queues the first `keep` experts (according to `order`) into `dst`, packed starting at offset 0.
+  void queue_experts(const std::string& name, const std::array<int, EXPERTS>& order, int keep, void* dst) {
+    const SafetensorsRef ref = m_.at(name);
+    if (ref->shape.empty() || ref->shape[0] != EXPERTS) throw std::runtime_error("weights: " + name + " is not [128, ...]");
+    queue_experts_impl(ref, order, keep, dst);
+  }
+
+  std::vector<TieredBuffer>* tiered() const { return tiered_; }
 
   void* alloc(std::size_t bytes) {
     storage_.emplace_back(bytes);
@@ -150,6 +155,22 @@ class Loader {
   std::size_t upload_reads() const { return upload_reads_; }
 
  private:
+  void queue_experts_impl(const SafetensorsRef& ref, const std::array<int, EXPERTS>& order, int keep, void* dst) {
+    const std::uint64_t eb = ref->bytes / EXPERTS;
+    auto* base = static_cast<std::byte*>(dst);
+    // Read in checkpoint order so adjacent experts can share a staged read. The inverse mapping
+    // keeps the original hot/cold order in the CUDA allocation, including plans that omit experts.
+    std::array<int, EXPERTS> destination;
+    destination.fill(-1);
+    for (int j = 0; j < keep; ++j) destination[order[j]] = j;
+    for (int expert = 0; expert < EXPERTS; ++expert) {
+      const int j = destination[expert];
+      if (j < 0) continue;
+      pending_.push_back(UploadRequest{ref.file, ref->offset + std::uint64_t(expert) * eb,
+                                       eb, base + std::size_t(j) * eb});
+    }
+  }
+
   const SafetensorsModel& m_;
   DeviceUploader& up_;
   cudaStream_t stream_;
@@ -157,6 +178,27 @@ class Loader {
   std::vector<TieredBuffer>* tiered_;
   std::vector<UploadRequest> pending_;
   std::size_t upload_reads_ = 0;
+};
+
+bool pack_scales_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("INGINE_PACK_SCALES");
+    return !e || std::atoi(e) != 0;
+  }();
+  return on;
+}
+
+struct PackScratch {
+  DeviceBuffer s13, s2, minmax;
+  PackScratch()
+      : s13(std::size_t(EXPERTS) * 2 * INTER * (HIDDEN / 16)),
+        s2(std::size_t(EXPERTS) * HIDDEN * (INTER / 16)),
+        minmax(4 * sizeof(std::uint32_t)) {}
+};
+
+struct PackStats {
+  int planes = 0;
+  std::size_t saved_bytes = 0;
 };
 
 // Placement of one layer's routed experts (WeightOptions::expert_plan).
@@ -259,7 +301,8 @@ Dense row_view(const Dense& d, int begin, int end) {
 // GGUF expert mode: set by load_weights for the duration of a load.
 const GgufFile* g_gguf_experts = nullptr;
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const LayerPlan& plan = LayerPlan{}) {
+Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const LayerPlan& plan = LayerPlan{},
+                      PackScratch* pack = nullptr, PackStats* pack_stats = nullptr) {
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -387,6 +430,19 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
   const std::string e = p + "mlp.experts.";
   Experts& ex = layer.experts;
   ex.fmt = fmt;
+  const bool nv = fmt == ExpertFormat::NVFP4;
+  const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
+  if (!g_gguf_experts && (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
+      m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales))
+    throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
+
+  std::unique_ptr<PackScratch> local_pack;
+  const bool pack_nv_scales = nv && !g_gguf_experts && pack_scales_enabled();
+  if (pack_nv_scales && !pack) {
+    local_pack = std::make_unique<PackScratch>();
+    pack = local_pack.get();
+  }
+
   if (g_gguf_experts) {
     if (!plan.identity()) throw std::invalid_argument("weights: GGUF experts need the identity expert plan");
     const GgufFile& g = *g_gguf_experts;
@@ -411,6 +467,16 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
     ex.g13 = d13;
     ex.g2 = d2;
     ex.fmt = ExpertFormat::NVFP4;  // the prefill's transcoded layout
+  } else if (pack_nv_scales) {
+    if (plan.identity()) {
+      ex.w13 = ld.raw(e + "w13_weight");
+      ex.w2 = ld.raw(e + "w2_weight");
+    } else {
+      ex.w13 = ld.experts(e + "w13_weight", plan.order, plan.hot, plan.keep);
+      ex.w2 = ld.experts(e + "w2_weight", plan.order, plan.hot, plan.keep);
+    }
+    ld.queue_experts(e + "w13_weight_scale", plan.order, plan.keep, pack->s13.p);
+    ld.queue_experts(e + "w2_weight_scale", plan.order, plan.keep, pack->s2.p);
   } else if (plan.identity()) {
     ex.w13 = ld.raw(e + "w13_weight");
     ex.w13_scale = ld.raw(e + "w13_weight_scale");
@@ -422,11 +488,6 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
     ex.w2 = ld.experts(e + "w2_weight", plan.order, plan.hot, plan.keep);
     ex.w2_scale = ld.experts(e + "w2_weight_scale", plan.order, plan.hot, plan.keep);
   }
-  const bool nv = fmt == ExpertFormat::NVFP4;
-  const std::string want_codes = nv ? "U8" : "F8_E4M3", want_scales = nv ? "F8_E4M3" : "U8";
-  if (!ex.gguf() && (m.at(e + "w13_weight")->dtype != want_codes || m.at(e + "w13_weight_scale")->dtype != want_scales ||
-      m.at(e + "w2_weight")->dtype != want_codes || m.at(e + "w2_weight_scale")->dtype != want_scales))
-    throw std::runtime_error("weights: layer " + std::to_string(l) + " experts do not match their format");
   if (nv && !ex.gguf()) {
     for (const char* w : {"w13", "w2"}) {
       const std::vector<float> amax = host_f32(m, e + w + "_weight_amax");
@@ -444,10 +505,66 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
   if (dense_fp8) {
     layer.wproj = to_fp8(ld, wproj_bf16, R, H);
     layer.wo = to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM);
-    CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before the BF16 temporaries are freed
+    if (!pack_nv_scales) CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before the BF16 temporaries are freed
   } else {
     layer.wproj = Dense{wproj_bf16, {}};
     layer.wo = Dense{wo_bf16, {}};
+  }
+  if (pack_nv_scales) {
+    const SafetensorsRef r13 = m.at(e + "w13_weight_scale");
+    const SafetensorsRef r2 = m.at(e + "w2_weight_scale");
+    const std::size_t c13 = std::size_t(plan.keep) * (r13->bytes / EXPERTS);
+    const std::size_t c2 = std::size_t(plan.keep) * (r2->bytes / EXPERTS);
+    auto* mm_dev = static_cast<std::uint32_t*>(pack->minmax.p);
+    kernels::moe::nvfp4_scales_minmax(static_cast<const std::uint8_t*>(pack->s13.p), c13, mm_dev, ld.stream());
+    kernels::moe::nvfp4_scales_minmax(static_cast<const std::uint8_t*>(pack->s2.p), c2, mm_dev + 2, ld.stream());
+    std::array<std::uint32_t, 4> mm_host{};
+    CUDA_CHECK(cudaMemcpyAsync(mm_host.data(), mm_dev, sizeof(mm_host), cudaMemcpyDeviceToHost, ld.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ld.stream()));
+    auto finalize_scale = [&](const SafetensorsRef& ref, const void* raw_dev, std::uint32_t lo, std::uint32_t hi,
+                              Tensor& out_tensor, int& out_base) {
+      const std::size_t raw_eb = ref->bytes / EXPERTS;
+      const std::size_t raw_bytes = std::size_t(plan.keep) * raw_eb;
+      const std::int32_t rows = std::int32_t(ref->shape.at(1));
+      const std::int32_t raw_cols = std::int32_t(ref->shape.at(2));
+      const bool can_pack = (hi >= lo && hi - lo <= 63 && (raw_cols % 4) == 0 && (raw_eb % 16) == 0);
+      if (can_pack) {
+        const std::size_t packed_eb = (raw_eb / 4) * 3;
+        const std::size_t packed_bytes = std::size_t(plan.keep) * packed_eb;
+        void* dst = nullptr;
+        if (plan.hot == EXPERTS && plan.keep == EXPERTS) {
+          dst = ld.alloc(packed_bytes + 16);
+        } else {
+          if (ld.tiered() == nullptr) throw std::logic_error("finalize_scale: no tiered storage");
+          ld.tiered()->emplace_back(packed_bytes + 16, std::size_t(plan.hot) * packed_eb);
+          dst = ld.tiered()->back().data();
+        }
+        kernels::moe::pack_nvfp4_scales_6bit(static_cast<const std::uint8_t*>(raw_dev),
+                                             static_cast<std::uint32_t*>(dst), raw_bytes, std::uint8_t(lo),
+                                             ld.stream());
+        out_base = int(lo);
+        out_tensor = rm(dst, DType::U8, {EXPERTS, rows, (raw_cols / 4) * 3});
+        if (pack_stats) {
+          ++pack_stats->planes;
+          pack_stats->saved_bytes += raw_bytes - packed_bytes;
+        }
+      } else {
+        void* dst = nullptr;
+        if (plan.hot == EXPERTS && plan.keep == EXPERTS) {
+          dst = ld.alloc(raw_bytes);
+        } else {
+          if (ld.tiered() == nullptr) throw std::logic_error("finalize_scale: no tiered storage");
+          ld.tiered()->emplace_back(raw_bytes, std::size_t(plan.hot) * raw_eb);
+          dst = ld.tiered()->back().data();
+        }
+        CUDA_CHECK(cudaMemcpyAsync(dst, raw_dev, raw_bytes, cudaMemcpyDeviceToDevice, ld.stream()));
+        out_base = -1;
+        out_tensor = rm(dst, DType::FP8_E4M3FN, {EXPERTS, rows, raw_cols});
+      }
+    };
+    finalize_scale(r13, pack->s13.p, mm_host[0], mm_host[1], ex.w13_scale, ex.w13_scale_base);
+    finalize_scale(r2, pack->s2.p, mm_host[2], mm_host[3], ex.w2_scale, ex.w2_scale_base);
+    if (local_pack) CUDA_CHECK(cudaStreamSynchronize(ld.stream()));
   }
   Dense* views[NUM_SEGS] = {&layer.wq, &layer.wgate, &layer.wr, &layer.wsink,
                             &layer.wk, &layer.wv,    &layer.wk_dyn, &layer.wv_dyn};
@@ -481,10 +598,27 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
   struct Reset {
     ~Reset() { g_gguf_experts = nullptr; }
   } reset_gguf;
+  std::unique_ptr<PackScratch> pack_scratch;
+  PackStats pack_stats;
+  if (!g_gguf_experts && pack_scales_enabled()) {
+    for (int l = 0; l < LAYERS; ++l) {
+      if (w.expert_formats[l] == ExpertFormat::NVFP4) {
+        pack_scratch = std::make_unique<PackScratch>();
+        break;
+      }
+    }
+  }
   for (int l = 0; l < LAYERS; ++l) {
-    w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8, plan[l]));
+    w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8, plan[l], pack_scratch.get(), &pack_stats));
     w.experts_hot[l] = plan[l].hot;
     w.experts_keep[l] = plan[l].keep;
+  }
+  if (pack_scratch) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    pack_scratch.reset();
+    if (pack_stats.planes > 0)
+      spdlog::info("packed {} NVFP4 expert scale planes to 6-bit (saved {:.1f} MiB)", pack_stats.planes,
+                   double(pack_stats.saved_bytes) / 1048576.0);
   }
 
   const auto layers_ready = Clock::now();

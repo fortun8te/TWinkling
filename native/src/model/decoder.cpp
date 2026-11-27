@@ -46,8 +46,16 @@ DeviceBuffer upload_ints(const std::vector<int>& v) {
 }  // namespace
 
 Decoder::Decoder(const Weights& w, const Ablation& abl, State& st, bool pdl)
-    : w_(w), abl_(abl), st_(st), pdl_(pdl), attn_ws_(attn::workspace_bytes(8)) {
+    : w_(w),
+      abl_(abl),
+      st_(st),
+      pdl_(pdl),
+      attn_ws_(attn::workspace_bytes(8)),
+      lend_table_(LAYERS * sizeof(moe::ExpertLend)),
+      lend_active_(sizeof(int)) {
   attn_ws_.fill(0);  // zeroed once; the kernel resets its counter itself
+  lend_table_.fill(0);
+  lend_active_.fill(0);
   segments_[0] = upload_ints(proj_layout(false, true));
   segments_[1] = upload_ints(proj_layout(false, false));
   full_segments_ = upload_ints(proj_layout(true, false));
@@ -199,7 +207,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.v_conv = f32p(layer.v_conv);
       a.k_cache = st.k_ring_at(ri).data;
       a.v_cache = st.v_ring_at(ri).data;
-      a.cache_fp8 = false;
+      a.cache_fp8 = st.ring_fp8;
       a.cache_rows = WINDOW;
       a.kpos = st.ring_pos_at(ri);
       a.window = WINDOW;
@@ -244,12 +252,15 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       continue;
     }
     const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
+    const auto* lend = static_cast<const moe::ExpertLend*>(lend_table_.p) + l;
+    const auto* lend_active = static_cast<const int*>(lend_active_.p);
     moe::moe_up(bf16m(b.xm), m, idx, ex.w13.data, ex.w13_scale.data,
-                f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream);
+                f32p(ex.w13_factor), fmt, bf16m(b.act), pdl, stream, ex.w13_scale_base, lend, lend_active);
     // with PDL, moe_down prefetches weights before waiting: valid because moe_up always precedes it
     moe::moe_down(bf16m(b.act), m, idx, f32p(b.wts), ex.w2.data, ex.w2_scale.data,
                   f32p(ex.w2_factor), fmt, f32p(layer.mlp_conv), st.conv_mlp_at(v), f32m(b.y2),
-                  history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, pdl, stream);
+                  history ? f32m(b.hist_mlp) + std::size_t(v) * m * H : nullptr, pdl, stream, ex.w2_scale_base, lend,
+                  lend_active);
     prev_v = v;
   }
   // ---- final read; the same launch writes b.taps[:, 3] = b.xf

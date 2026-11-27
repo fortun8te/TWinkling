@@ -4,9 +4,13 @@
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "kernels/moe/moe.h"
+
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ingine::model {
@@ -111,12 +115,13 @@ void Runtime::init() {
       }
     }
   }
+  const std::size_t ring_elem = state_.ring_fp8 ? 1 : 2;
   for (int i = 0; i < 2; ++i) {
     undo_storage_[i] = DeviceBuffer(kUndoBytes);
     Carve c{static_cast<char*>(undo_storage_[i].p)};
     undo_[i].conv = c.take<float>(std::size_t(NUM_VISITS) * CONV_ROW_FLOATS);
-    undo_[i].k = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
-    undo_[i].v = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM);
+    undo_[i].k = c.take<std::uint8_t>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM * ring_elem);
+    undo_[i].v = c.take<std::uint8_t>(std::size_t(NUM_SLIDING_VISITS) * KV_DIM * ring_elem);
     undo_[i].pos = c.take<std::int64_t>(NUM_SLIDING_VISITS);
   }
 
@@ -132,8 +137,8 @@ void Runtime::init() {
     backup_storage_ = DeviceBuffer(kBackupBytes);
     Carve c{static_cast<char*>(backup_storage_.p)};
     for (int i = 0; i < 4; ++i) backup_.conv[i] = c.take<float>(std::size_t(NUM_VISITS) * 3 * CONV_COLS[i]);
-    backup_.k = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
-    backup_.v = c.take<__nv_bfloat16>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM);
+    backup_.k = c.take<std::uint8_t>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM * ring_elem);
+    backup_.v = c.take<std::uint8_t>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth * KV_DIM * ring_elem);
     backup_.pos = c.take<std::int64_t>(std::size_t(NUM_SLIDING_VISITS) * kMaxWidth);
   }
   // every width reads its tokens from the shared buffer (set_inputs, chain_advance and the verify selector
@@ -170,9 +175,10 @@ StatePtrs Runtime::state_ptrs() const {
   p.conv[1] = ptr<float>(state_.conv_v);
   p.conv[2] = ptr<float>(state_.conv_attn);
   p.conv[3] = ptr<float>(state_.conv_mlp);
-  p.k_ring = ptr<__nv_bfloat16>(state_.k_ring);
-  p.v_ring = ptr<__nv_bfloat16>(state_.v_ring);
+  p.k_ring = state_.k_ring.data;
+  p.v_ring = state_.v_ring.data;
   p.ring_pos = ptr<std::int64_t>(state_.ring_pos);
+  p.ring_fp8 = state_.ring_fp8;
   return p;
 }
 
@@ -465,6 +471,104 @@ GraphExec Runtime::capture_switch(const std::function<void(cudaStream_t, cudaGra
   GraphExec result(exec);
   CUDA_CHECK(cudaGraphUpload(exec, stream_));
   return result;
+}
+
+void Runtime::setup_prefill_lend(void* arena, std::size_t arena_bytes) {
+  static const bool enabled = [] {
+    const char* e = std::getenv("INGINE_PREFILL_LEND");
+    return !e || std::atoi(e) != 0;
+  }();
+  lend_copies_.clear();
+  lend_populated_ = false;
+  if (!enabled || !arena || arena_bytes < (8u << 20)) return;
+
+  std::array<int, LAYERS> lend_n{};
+  std::array<std::size_t, LAYERS> b13{}, b13s{}, b2{}, b2s{}, per_ex{};
+  bool any_cold = false;
+  for (int l = 0; l < LAYERS; ++l) {
+    const Experts& ex = weights_.layers[l].experts;
+    if (ex.gguf() || weights_.experts_keep[l] <= weights_.experts_hot[l]) continue;
+    b13[l] = ex.w13.bytes() / EXPERTS;
+    b13s[l] = ex.w13_scale.bytes() / EXPERTS;
+    b2[l] = ex.w2.bytes() / EXPERTS;
+    b2s[l] = ex.w2_scale.bytes() / EXPERTS;
+    per_ex[l] = b13[l] + b13s[l] + b2[l] + b2s[l];
+    any_cold = true;
+  }
+  if (!any_cold) return;
+
+  // Reserve 1 KiB per layer for 256-byte alignment + 16-byte scale padding.
+  const std::size_t overhead = std::size_t(LAYERS) * 1024;
+  if (arena_bytes <= overhead) return;
+  std::size_t avail = arena_bytes - overhead;
+
+  // Water-fill extra hot experts across cold layers (loop layers weighted 3x by visit count).
+  int total_lent = 0;
+  while (true) {
+    int best_l = -1;
+    double best_score = 1e30;
+    for (int l = 0; l < LAYERS; ++l) {
+      if (per_ex[l] == 0 || per_ex[l] > avail) continue;
+      const int cur = weights_.experts_hot[l] + lend_n[l];
+      if (cur >= weights_.experts_keep[l]) continue;
+      const double score = double(cur) / (is_loop_layer(l) ? 3.0 : 1.0);
+      if (score < best_score) {
+        best_score = score;
+        best_l = l;
+      }
+    }
+    if (best_l < 0) break;
+    ++lend_n[best_l];
+    avail -= per_ex[best_l];
+    ++total_lent;
+  }
+  if (total_lent == 0) return;
+
+  std::array<kernels::moe::ExpertLend, LAYERS> table{};
+  char* dst = static_cast<char*>(arena);
+  int layers_lent = 0;
+  auto carve_copy = [&](const Tensor& t, int first, int count, std::size_t eb, bool pad_zero) -> void* {
+    void* p = dst;
+    const std::size_t bytes = std::size_t(count) * eb;
+    lend_copies_.push_back(LendCopy{p, static_cast<const char*>(t.data) + std::size_t(first) * eb, bytes, pad_zero});
+    dst += carved(bytes + (pad_zero ? 16 : 0));
+    return p;
+  };
+  for (int l = 0; l < LAYERS; ++l) {
+    if (lend_n[l] == 0) continue;
+    ++layers_lent;
+    const int first = weights_.experts_hot[l];
+    const int count = lend_n[l];
+    const Experts& ex = weights_.layers[l].experts;
+    table[l].first = first;
+    table[l].count = count;
+    table[l].w13 = carve_copy(ex.w13, first, count, b13[l], false);
+    table[l].w13_scale = carve_copy(ex.w13_scale, first, count, b13s[l], true);
+    table[l].w2 = carve_copy(ex.w2, first, count, b2[l], false);
+    table[l].w2_scale = carve_copy(ex.w2_scale, first, count, b2s[l], true);
+  }
+  const std::size_t used = std::size_t(dst - static_cast<char*>(arena));
+  if (used > arena_bytes) throw std::logic_error("setup_prefill_lend: exceeded arena_bytes");
+  CUDA_CHECK(cudaMemcpy(decoder_->lend_table(), table.data(), sizeof(table), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(decoder_->lend_active(), 0, sizeof(int)));
+  spdlog::info("prefill arena lend: +{} decode experts across {} layers ({:.1f} / {:.1f} MiB)", total_lent, layers_lent,
+               double(used) / (1024.0 * 1024.0), double(arena_bytes) / (1024.0 * 1024.0));
+}
+
+void Runtime::populate_prefill_lend() {
+  if (lend_copies_.empty() || lend_populated_) return;
+  for (const LendCopy& c : lend_copies_) {
+    CUDA_CHECK(cudaMemcpyAsync(c.dst, c.src, c.bytes, cudaMemcpyDefault, stream_));
+    if (c.pad_zero) CUDA_CHECK(cudaMemsetAsync(static_cast<char*>(c.dst) + c.bytes, 0, 16, stream_));
+  }
+  CUDA_CHECK(cudaMemsetAsync(decoder_->lend_active(), 1, 1, stream_));  // int32 = 1 on little-endian
+  lend_populated_ = true;
+}
+
+void Runtime::vacate_prefill_lend() {
+  if (!lend_populated_) return;
+  CUDA_CHECK(cudaMemsetAsync(decoder_->lend_active(), 0, sizeof(int), stream_));
+  lend_populated_ = false;
 }
 
 }  // namespace ingine::model
