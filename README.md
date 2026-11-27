@@ -44,7 +44,7 @@ Linux x86-64 or Windows with WSL2 (tested on Ubuntu 26.04 under WSL2). You need 
 
 ```bash
 git clone https://github.com/fortun8te/TWinkling-2-Mini-RTX5080.git
-cd TWinkling
+cd TWinkling-2-Mini-RTX5080
 bash scripts/setup-5080.sh
 TWINKLING_PROFILE=128k bash scripts/rtx5080/serve-5080.sh
 ```
