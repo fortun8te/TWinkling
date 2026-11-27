@@ -103,6 +103,9 @@ struct RuntimeOptions {
   bool profile_experts = false;
   int spec_shortlist_rows = 32768;
   bool suffix_draft = false;
+  // DFlash2 block-diffusion drafter (incoai/Inkling-2-Mini-DFlash2 checkpoint directory) in place of DSpark's
+  // proposals; DSpark stays loaded for the loop's scratch. Empty: DSpark.
+  std::filesystem::path dflash2_dir;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
   // min(3072, free memory after start-up - 4096), at least 0.

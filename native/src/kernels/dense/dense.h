@@ -19,6 +19,7 @@ struct Matrix {
   const void* w = nullptr;
   const float* scale = nullptr;
   int rows = 0;
+  int cols = 0;  // K for entry points that take several widths (DFlash2); 0 = the entry point's fixed K
 };
 
 // Group-32 symmetric INT4 proxy matrix [rows, 2304] in VRAM for Certified Lazy LM Head.
@@ -51,6 +52,10 @@ void head(const __nv_bfloat16* x, int M, Matrix w, float* out, bool pdl, cudaStr
 void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, cudaStream_t stream);
 
 // fp8_rows: bf16 [rows, K] -> float8_e4m3fn [rows, K] (q) + fp32 scale [rows] = amax / 448.
+// Eight-row DFlash2 projection with E4M3 weights (K = w.cols) and BF16 or FP32 output [8, w.rows].
+void dflash2_fp8(const __nv_bfloat16* x, Matrix w, __nv_bfloat16* out, cudaStream_t stream);
+void dflash2_fp8_f32(const __nv_bfloat16* x, Matrix w, float* out, cudaStream_t stream);
+
 void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream);
 
 // dequant_rows: weights.dequant: out = bf16(float(q) * scale[row]) for FP8 rows [rows, K].

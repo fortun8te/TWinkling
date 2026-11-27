@@ -11,6 +11,8 @@
 #include "core/host_memory.h"
 #include "core/vmm.h"
 #include "core/tensor.h"
+#include "model/tp_layout.h"
+#include "kernels/head/nvfp4_head.h"
 
 #include <array>
 #include <cstdint>
@@ -21,14 +23,12 @@ namespace ingine::model {
 
 // ------------------------------------------------------------------------------------ weights.py constants
 
-inline constexpr int HIDDEN = 2304;
-inline constexpr int HEADS = 24, KV_HEADS = 8, HEAD_DIM = 128;
-inline constexpr int D_REL = 16, REL_EXTENT = 1024, WINDOW = 1024;
-inline constexpr int INTER = 1152, EXPERTS = 128, TOP_K = 8;
-inline constexpr int CONV_K = 4;
+// HIDDEN, HEADS, KV_HEADS, HEAD_DIM, D_REL, CONV_K, INTER, VOCAB, UNPADDED_VOCAB, KV_DIM and the projection
+// segments (Seg, SEG_ROWS, SEG_INPUT, num_segs) come from model/tp_layout.h.
+inline constexpr int REL_EXTENT = 1024, WINDOW = 1024;
+inline constexpr int EXPERTS = 128, TOP_K = 8;
 inline constexpr int LAYERS = 24, BLOCK = 6;
 inline constexpr int LOOP_START = 6, LOOP_END = 18, PASSES = 3;
-inline constexpr int VOCAB = 201024, UNPADDED_VOCAB = 200058;
 inline constexpr int GATE_RANK = 64;
 inline constexpr float EPS = 1e-6f;
 inline constexpr double QK_CLIP = 22.627416997969522, REL_CLIP = 8.0;
@@ -36,7 +36,6 @@ inline constexpr double LOG_ALPHA = 0.1, LOG_FLOOR = 8192.0;
 inline constexpr float GATE_SOFTCAP = 4.0f, UP_SOFTCAP = 25.0f, LOGIT_SOFTCAP = 30.0f;
 inline constexpr float ROUTE_SCALE = 8.0f;
 inline constexpr float FP8_MAX = 448.0f;  // largest finite float8_e4m3fn (model.FP8_MAX)
-inline constexpr int KV_DIM = KV_HEADS * HEAD_DIM;  // 1024
 
 inline constexpr bool is_full_layer(int l) { return l == 5 || l == 11 || l == 17 || l == 23; }
 inline constexpr bool is_loop_layer(int l) { return LOOP_START <= l && l < LOOP_END; }
@@ -84,11 +83,6 @@ inline constexpr int NUM_TAPS = 4;
 // ----------------------------------------------------------------------------- fast.py projection layout
 
 // SEG_ROWS order (KERNELS.md): q | gate | rel | sink | k | v | (full layers) k_dyn | v_dyn
-enum Seg : int { SEG_Q = 0, SEG_GATE, SEG_REL, SEG_SINK, SEG_K, SEG_V, SEG_K_DYN, SEG_V_DYN, NUM_SEGS };
-inline constexpr std::array<int, NUM_SEGS> SEG_ROWS = {HEADS * HEAD_DIM, HEADS * HEAD_DIM, HEADS * D_REL, HEADS,
-                                                       KV_DIM,           KV_DIM,           KV_HEADS * CONV_K,
-                                                       KV_HEADS * CONV_K};
-inline constexpr std::array<int, NUM_SEGS> SEG_INPUT = {0, 0, 0, 0, 1, 2, 1, 2};  // xin index (q, k, v inputs)
 inline constexpr std::array<int, NUM_SEGS + 1> SEG_BEGIN = [] {
   std::array<int, NUM_SEGS + 1> b{};
   for (int s = 0; s < NUM_SEGS; ++s) b[s + 1] = b[s] + SEG_ROWS[s];
@@ -96,7 +90,6 @@ inline constexpr std::array<int, NUM_SEGS + 1> SEG_BEGIN = [] {
 }();
 inline constexpr int PROJ_ROWS_SLIDING = SEG_BEGIN[SEG_K_DYN];  // 8600
 inline constexpr int PROJ_ROWS_FULL = SEG_BEGIN[NUM_SEGS];      // 8664
-inline constexpr int num_segs(bool full) { return full ? NUM_SEGS : SEG_K_DYN; }
 inline constexpr int proj_rows(bool full) { return full ? PROJ_ROWS_FULL : PROJ_ROWS_SLIDING; }
 
 // --------------------------------------------------------------------------------------------- helpers
@@ -203,6 +196,7 @@ struct Weights {
   Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 rows + scales (in mapped host RAM when lazy_head)
   Tensor unembed_q4_codes;    // u8 [UNPADDED_VOCAB, H/2] in VRAM when lazy_head (group-32 INT4 proxy)
   Tensor unembed_q4_scales;   // f16 [UNPADDED_VOCAB, H/32] in VRAM when lazy_head
+  kernels::head::Nvfp4Matrix unembed_nvfp4;  // optional NVFP4 copy in VRAM for the DFlash2 drafter (INGINE_HEAD_NVFP4)
   Tensor message_queries;     // fp32 [12, 4, H]: q, k, v, mlp per loop layer
   std::array<ExpertFormat, LAYERS> expert_formats{};
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows

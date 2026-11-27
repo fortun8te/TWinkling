@@ -388,11 +388,69 @@ void benchmark_v4() {
   INGINE_TEST_CUDA(cudaEventDestroy(start));
 }
 
+void benchmark_sliding() {
+  constexpr int max_m = 8, repeats = 48;
+  DeviceArray<float> proj(size_t(max_m) * 8664), q(HQ * D), rel(HQ * DREL), rel_proj(DREL * EXT),
+      k_conv(4 * C), v_conv(4 * C), conv_k(3 * C), conv_v(3 * C);
+  DeviceArray<uint8_t> k(size_t(WIN) * C * 2), v(size_t(WIN) * C * 2), work(attn::workspace_bytes(max_m));
+  DeviceArray<__nv_bfloat16> out(size_t(max_m) * HQ * D);
+  int p0 = 0;
+  const std::vector<int64_t> kp = ring("wrapped", p0);
+  DeviceArray<int64_t> kpos(kp), pos(std::vector<int64_t>{p0});
+  attn::DecodeArgs a{};
+  a.proj = proj.get();
+  a.q_scale = q.get();
+  a.r_scale = rel.get();
+  a.rel_proj = rel_proj.get();
+  a.k_conv = k_conv.get();
+  a.v_conv = v_conv.get();
+  a.conv_k_state = conv_k.get();
+  a.conv_v_state = conv_v.get();
+  a.k_cache = k.get();
+  a.v_cache = v.get();
+  a.kpos = kpos.get();
+  a.pos = pos.get();
+  a.cache_rows = WIN;
+  a.window = WIN;
+  a.workspace = work.get();
+  a.workspace_size = work.count;
+  a.out = out.get();
+  cudaEvent_t start, end;
+  INGINE_TEST_CUDA(cudaEventCreate(&start));
+  INGINE_TEST_CUDA(cudaEventCreate(&end));
+  std::printf("sliding_verify_width,median_us\n");
+  for (int width = 1; width <= 8; ++width) {
+    a.M = width;
+    for (int warmup = 0; warmup < 6; ++warmup) {
+      kpos.upload(kp);  // keep the ring wrapped (the kernel advances kpos)
+      attn::attn_decode(a, g_stream);
+    }
+    INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
+    std::array<float, 7> elapsed{};
+    for (auto& ms : elapsed) {
+      INGINE_TEST_CUDA(cudaEventRecord(start, g_stream));
+      for (int i = 0; i < repeats; ++i) attn::attn_decode(a, g_stream);
+      INGINE_TEST_CUDA(cudaEventRecord(end, g_stream));
+      INGINE_TEST_CUDA(cudaEventSynchronize(end));
+      INGINE_TEST_CUDA(cudaEventElapsedTime(&ms, start, end));
+    }
+    std::sort(elapsed.begin(), elapsed.end());
+    std::printf("%d,%.3f\n", width, elapsed[elapsed.size() / 2] * 1000 / repeats);
+  }
+  INGINE_TEST_CUDA(cudaEventDestroy(end));
+  INGINE_TEST_CUDA(cudaEventDestroy(start));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (skip_without_gpu()) return kSkip;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-sliding") == 0) {
+    benchmark_sliding();
+    INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--benchmark-v4") == 0) {
     benchmark_v4();
     INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));

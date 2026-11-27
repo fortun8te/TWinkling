@@ -10,6 +10,7 @@
 #include "core/device.h"
 #include "kernels/head/head.h"
 #include "model/drafter.h"
+#include "model/dflash2.h"
 #include "model/prefill.h"
 #include "model/runtime.h"
 #include "model/spec.h"
@@ -72,7 +73,15 @@ class EngineGenerator final : public Generator {
                                            options.spec_shortlist_rows);
       drafter_->capture();
       taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
-      spec_ = std::make_unique<SpecLoop>(rt_, *drafter_);
+      if (!options.dflash2_dir.empty()) {
+        const auto& head = rt_.weights().unembed_nvfp4;
+        if (!head.codes)
+          throw std::invalid_argument("DFlash2 needs the NVFP4 head copy: set INGINE_HEAD_NVFP4=1 (with --dense-fp8)");
+        flash_ = std::make_unique<DFlash2>(options.dflash2_dir, rt_.stream(), false);
+        flash_->bind_head(head, ptr<const __nv_bfloat16>(rt_.weights().embed), ptr<const float>(rt_.weights().embed_norm));
+        flash_->warmup();
+      }
+      spec_ = std::make_unique<SpecLoop>(rt_, *drafter_, flash_.get());
     }
     // checkpoint layout: target state | drafter context | last prompt logits (in pinned host RAM to free ~300 MiB VRAM)
     checkpoint_drafter_ = carved(rt_.checkpoint_bytes());
@@ -194,6 +203,7 @@ class EngineGenerator final : public Generator {
     tokens_in_state_.clear();
     checkpoint_ids_.clear();
     if (drafter_) drafter_->reset();  // stream-ordered; CUDA failures abort (CUDA_CHECK)
+    if (flash_) flash_->reset();
   }
 
   // Plain decoding after the prefill of n tokens (logits in logits_): the token at position p is sampled on
@@ -267,14 +277,17 @@ class EngineGenerator final : public Generator {
   void prefill(std::span<const std::int32_t> ids, std::span<const PromptImage> images, GenerateStats& stats) {
     const std::vector<std::int32_t>& prev = tokens_in_state_;
     const std::size_t n = ids.size();
-    const bool drafter_in_step = !drafter_ || drafter_->length() == int(prev.size());  // else a row is missing
+    // DFlash2 (no checkpoint support yet): only exact in-step extension is reused; DSpark is not advanced
+    // during DFlash2 decoding, so its length check also forces a fresh prefill after a DFlash2 generation.
+    const bool drafter_in_step = (!drafter_ || drafter_->length() == int(prev.size())) &&
+                                 (!flash_ || flash_->length() == int(prev.size()));  // else a row is missing
     State& st = rt_.state();
     const cudaStream_t stream = rt_.stream();
     const bool extend =
         drafter_in_step && !prev.empty() && prev.size() < n && std::equal(prev.begin(), prev.end(), ids.begin());
-    const bool checkpoint = !extend && !checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
+    const bool checkpoint = !flash_ && !extend && !checkpoint_ids_.empty() && checkpoint_ids_.size() <= n &&
                             std::equal(checkpoint_ids_.begin(), checkpoint_ids_.end(), ids.begin());
-    Parked* parked = find_parked(ids, extend ? prev.size() : checkpoint ? checkpoint_ids_.size() : 0);
+    Parked* parked = flash_ ? nullptr : find_parked(ids, extend ? prev.size() : checkpoint ? checkpoint_ids_.size() : 0);
     std::size_t start = 0;
     if (parked) {
       // parking the live conversation may move the parked list (never evicting the one to restore)
@@ -295,6 +308,7 @@ class EngineGenerator final : public Generator {
       park_live();
       reset_state(st, stream);
       if (drafter_) drafter_->reset();
+      if (flash_) flash_->reset();
       tokens_in_state_.clear();
       checkpoint_ids_.clear();
       stats.reuse = Reuse::None;
@@ -352,6 +366,7 @@ class EngineGenerator final : public Generator {
         }
         drafter_->commit(taps, int(s));
       }
+      if (flash_) flash_->commit(static_cast<const __nv_bfloat16*>(taps_.p), T, int(s), false);
     }
     if (!encoded.empty()) CUDA_CHECK(cudaStreamSynchronize(stream));  // queued chunks read the rows freed here
     tokens_in_state_.assign(ids.begin(), ids.end());
@@ -547,6 +562,7 @@ class EngineGenerator final : public Generator {
   Runtime& rt_;
   Prefiller prefiller_;
   std::unique_ptr<Drafter> drafter_;
+  std::unique_ptr<DFlash2> flash_;  // declared before spec_: the loop holds a pointer to it
   std::unique_ptr<SpecLoop> spec_;
   std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)
   DeviceBuffer chunk_tokens_, logits_, token_, taps_;

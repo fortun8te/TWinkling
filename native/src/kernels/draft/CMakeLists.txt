@@ -20,8 +20,10 @@ add_library(ingine_kernels_draft STATIC
   fold.cu
   gemm.cpp
   markov.cu
+  shortlist.cu
+  dflash2_selector.cu
   ${_shortlist_cpp}
 )
 ingine_cuda_target(ingine_kernels_draft)
 ingine_internal_includes(ingine_kernels_draft)
-target_link_libraries(ingine_kernels_draft PUBLIC ingine_core CUDA::cudart CUDA::cublasLt)
+target_link_libraries(ingine_kernels_draft PUBLIC ingine_core ingine_kernels_head CUDA::cudart CUDA::cublasLt)

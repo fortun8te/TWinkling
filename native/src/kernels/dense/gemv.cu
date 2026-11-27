@@ -230,6 +230,28 @@ __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
 // (xor of all the batch's loads) & zero, so ptxas cannot interleave the mma with the batch's loads and
 // all U steps' loads of a warp are in flight together (otherwise it issues one step's loads at a time,
 // ~1 KB per warp, and scattered 64-byte requests from 16 rows run at ~40% of DRAM bandwidth).
+struct DFlash2Epi {
+  static constexpr int kInputs = 1;
+  static constexpr bool kScatter = true;
+  const __nv_bfloat16* x;
+  __nv_bfloat16* out;
+  int rows;
+  __device__ int input_of(int) const { return 0; }
+  __device__ const __nv_bfloat16* x_of(int) const { return x; }
+  __device__ void store1(int row, int m, float v) const { out[size_t(m) * rows + row] = __float2bfloat16_rn(v); }
+};
+
+struct DFlash2F32Epi {
+  static constexpr int kInputs = 1;
+  static constexpr bool kScatter = true;
+  const __nv_bfloat16* x;
+  float* out;
+  int rows;
+  __device__ int input_of(int) const { return 0; }
+  __device__ const __nv_bfloat16* x_of(int) const { return x; }
+  __device__ void store1(int row, int m, float v) const { out[size_t(m) * rows + row] = v; }
+};
+
 template <bool FP8, int K, int M, int SPLITK, int U, class Epi>
 __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __restrict__ w,
                                                               const float* __restrict__ w_scale, int rows,
@@ -481,6 +503,35 @@ void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, 
   if (K == 3072) launch_gemv<3072, 32, 16, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
   else if (K == 9216) launch_gemv<9216, 0, 16, MMA_U_FP8, GemvEpi>(w, M, pdl, stream, make);
   else require(false, "gemv: K must be 3072 or 9216");
+}
+
+// DFlash2 drafter projections (after Frankengine, Apache-2.0): eight rows, E4M3 weights, K = w.cols.
+void dflash2_fp8(const __nv_bfloat16* x, Matrix w, __nv_bfloat16* out, cudaStream_t stream) {
+  require(x && w.w && w.scale && w.rows > 0 && out, "dflash2_fp8: invalid arguments");
+  const dim3 grid((w.rows + 15) / 16);
+  const auto* codes = static_cast<const uint8_t*>(w.w);
+  const DFlash2Epi epi{x, out, w.rows};
+  switch (w.cols) {
+    case 2048: launch_ex(gemv_mma_kernel<true, 2048, 8, 8, 4, DFlash2Epi>, grid, 256, 0, 1, false, stream, codes, w.scale, w.rows, 0u, epi); break;
+    case 2304: launch_ex(gemv_mma_kernel<true, 2304, 8, 12, 3, DFlash2Epi>, grid, 384, 0, 1, false, stream, codes, w.scale, w.rows, 0u, epi); break;
+    case 3456: launch_ex(gemv_mma_kernel<true, 3456, 8, 9, 3, DFlash2Epi>, grid, 288, 0, 1, false, stream, codes, w.scale, w.rows, 0u, epi); break;
+    case 4096: launch_ex(gemv_mma_kernel<true, 4096, 8, 8, 4, DFlash2Epi>, grid, 256, 0, 1, false, stream, codes, w.scale, w.rows, 0u, epi); break;
+    case 6912: launch_ex(gemv_mma_kernel<true, 6912, 8, 12, 3, DFlash2Epi>, grid, 384, 0, 1, false, stream, codes, w.scale, w.rows, 0u, epi); break;
+    case 9216: launch_ex(gemv_mma_kernel<true, 9216, 8, 16, 3, DFlash2Epi>, grid, 512, 0, 1, false, stream, codes, w.scale, w.rows, 0u, epi); break;
+    default: require(false, "dflash2_fp8: unsupported input width");
+  }
+}
+
+void dflash2_fp8_f32(const __nv_bfloat16* x, Matrix w, float* out, cudaStream_t stream) {
+  require(x && w.w && w.scale && w.rows > 0 && out, "dflash2_fp8_f32: invalid arguments");
+  const dim3 grid((w.rows + 15) / 16);
+  const auto* codes = static_cast<const uint8_t*>(w.w);
+  const DFlash2F32Epi epi{x, out, w.rows};
+  switch (w.cols) {
+    case 2048: launch_ex(gemv_mma_kernel<true, 2048, 8, 8, 4, DFlash2F32Epi>, grid, 256, 0, 1, false, stream, codes, w.scale, w.rows, 0u, epi); break;
+    case 3456: launch_ex(gemv_mma_kernel<true, 3456, 8, 9, 3, DFlash2F32Epi>, grid, 288, 0, 1, false, stream, codes, w.scale, w.rows, 0u, epi); break;
+    default: require(false, "dflash2_fp8_f32: unsupported input width");
+  }
 }
 
 void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream) {

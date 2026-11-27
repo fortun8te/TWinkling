@@ -44,8 +44,8 @@ Widths verify_widths(const Runtime& rt) {
 
 }  // namespace
 
-SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
-    : rt_(rt), drafter_(drafter), width_(sizeof(std::int32_t)), coupled_seed_(sizeof(std::uint64_t)),
+SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter, DFlash2* flash)
+    : rt_(rt), drafter_(drafter), flash_(flash), width_(sizeof(std::int32_t)), coupled_seed_(sizeof(std::uint64_t)),
       record_(sizeof(VerifyRecord)), forced_window_(kd::BLOCK * sizeof(std::int32_t)) {
   if (drafter.stream() != rt.stream()) throw std::invalid_argument("SpecLoop: drafter and runtime streams differ");
   const Widths widths = verify_widths(rt);
@@ -65,6 +65,7 @@ SpecLoop::SpecLoop(Runtime& rt, Drafter& drafter)
       });
   };
   verify_ = capture_verify(draft_.conf, draft_.tokens, rt.options().spec_threshold);
+  if (flash_) flash_verify_ = capture_verify(flash_->confidence(), flash_->tokens(), rt.options().spec_threshold);
   if (rt.options().suffix_draft) {
     suffix_input_ = MappedHostBuffer(sizeof(SuffixInput));
     const auto* input = static_cast<const SuffixInput*>(suffix_input_.device_ptr());
@@ -131,6 +132,8 @@ void SpecLoop::prepare_accept(const Sampling& sampling) {
       });
   };
   accept_ = capture_accept(draft_.tokens);
+  flash_accept_ = GraphExec();
+  if (flash_ && greedy) flash_accept_ = capture_accept(flash_->tokens());
   if (greedy && !forced && rt_.options().suffix_draft) {
     const auto* input = static_cast<const SuffixInput*>(suffix_input_.device_ptr());
     suffix_accept_ = capture_accept(input->tokens.data());
@@ -142,6 +145,10 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
                         std::span<const std::int32_t> stop_ids,
                         const std::function<bool(std::span<const std::int32_t>)>& on_tokens, GenerateStats& stats,
                         std::vector<std::int32_t>& tokens_in_state) {
+  if (flash_ && (sampling.temperature <= 0.f || !sampling.forced.empty())) {
+    generate_flash(token, max_new_tokens, sampling, stop_ids, on_tokens, stats, tokens_in_state);
+    return;
+  }
   const cudaStream_t stream = rt_.stream();
   int P = int(tokens_in_state.size());  // position of the anchor (sampled, not yet processed)
   if (drafter_.length() != P) throw std::logic_error("SpecLoop: drafter context does not match the state");
@@ -306,6 +313,111 @@ void SpecLoop::generate(std::int32_t token, int max_new_tokens, const Sampling& 
   stats.spec_accepted = accepted;
   stats.spec_suffix_rounds = suffix_rounds;
   stats.spec_suffix_accepted = suffix_accepted;
+}
+
+// DFlash2 rounds (greedy or forced replay): commit the previous round's kept rows, propose 7 drafts for the
+// anchor (one captured DFlash2 graph), verify the confident ones in the width the device picks, accept by
+// equality and roll back the rest. One host synchronisation per round, after the acceptance.
+void SpecLoop::generate_flash(std::int32_t token, int max_new_tokens, const Sampling& sampling,
+                              std::span<const std::int32_t> stop_ids,
+                              const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+                              GenerateStats& stats, std::vector<std::int32_t>& tokens_in_state) {
+  const cudaStream_t stream = rt_.stream();
+  int P = int(tokens_in_state.size());
+  if (flash_->length() != P) throw std::logic_error("SpecLoop: DFlash2 context does not match the state");
+  const bool forced = !sampling.forced.empty();
+  prepare_accept(sampling);
+  const auto* record = static_cast<const VerifyRecord*>(record_.data());
+  const bool trace_rounds = forced || rt_.options().profile_spec;
+  struct RoundEvents {
+    cudaEvent_t e[3];
+  };
+  std::vector<RoundEvents> events;
+  auto record_event = [&](int i) {
+    CUDA_CHECK(cudaEventCreate(&events.back().e[i]));
+    CUDA_CHECK(cudaEventRecord(events.back().e[i], stream));
+  };
+  int emitted = 0, rounds = 0, accepted = 0;
+  std::vector<std::int32_t> out{token};
+  int round_P = -1, round_m = 0, round_acc = 0;
+  for (;;) {
+    const std::int32_t anchor = out.back();
+    std::size_t k = 0;
+    bool done = false;
+    while (k < out.size()) {
+      const std::int32_t tok = out[k++];
+      ++emitted;
+      if (std::find(stop_ids.begin(), stop_ids.end(), tok) != stop_ids.end() || emitted == max_new_tokens) {
+        done = true;
+        break;
+      }
+    }
+    stats.generated_tokens = emitted;
+    const bool go_on = on_tokens(std::span<const std::int32_t>(out.data(), k));
+    if (done || !go_on) {
+      const int keep = int(k) - 1;
+      int kept = round_acc + 1;
+      if (round_P >= 0 && keep < round_acc) {
+        rt_.rollback(round_P, keep + 1, round_m);
+        tokens_in_state.resize(tokens_in_state.size() - std::size_t(round_acc - keep));
+        kept = keep + 1;
+      }
+      if (round_P >= 0) flash_->commit(ptr<const __nv_bfloat16>(rt_.buffers(round_m).taps), kept, round_P, true);
+      break;
+    }
+    if (trace_rounds) {
+      events.emplace_back();
+      record_event(0);
+    }
+    if (round_P >= 0)
+      flash_->commit(ptr<const __nv_bfloat16>(rt_.buffers(round_m).taps), round_acc + 1, round_P, true);
+    flash_->propose(anchor);
+    if (trace_rounds) record_event(1);
+    const std::int32_t inputs[1] = {anchor};
+    rt_.set_inputs(inputs, P);
+    if (forced) {
+      auto* w = static_cast<std::int32_t*>(forced_window_.data());
+      for (int i = 0; i < kd::BLOCK; ++i)
+        w[i] = std::size_t(emitted + i) < sampling.forced.size() ? sampling.forced[emitted + i] : 0;
+    }
+    flash_verify_.launch(stream);
+    flash_accept_.launch(stream);
+    CUDA_CHECK(cudaEventRecord(done_, stream));
+    if (trace_rounds) record_event(2);
+    CUDA_CHECK(cudaEventSynchronize(done_));
+    VerifyRecord r;
+    std::memcpy(&r, record, sizeof r);
+    const int acc = r.accepted;
+    round_P = P;
+    round_m = r.m;
+    round_acc = acc;
+    if (trace_rounds) {
+      int all = 0;
+      while (forced && all < kd::GAMMA && std::size_t(emitted + all) < sampling.forced.size() &&
+             r.drafts[all] == sampling.forced[emitted + all])
+        ++all;
+      stats.spec_trace.push_back({r.m, acc, all, 0.f, 0.f});
+    }
+    tokens_in_state.push_back(anchor);
+    tokens_in_state.insert(tokens_in_state.end(), r.drafts, r.drafts + acc);
+    P += acc + 1;
+    ++rounds;
+    accepted += acc;
+    out.assign(r.drafts, r.drafts + acc);
+    out.push_back(r.next);
+  }
+  if (trace_rounds) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::size_t i = 0; i < events.size(); ++i) {
+      if (i < stats.spec_trace.size()) {
+        CUDA_CHECK(cudaEventElapsedTime(&stats.spec_trace[i].draft_ms, events[i].e[0], events[i].e[1]));
+        CUDA_CHECK(cudaEventElapsedTime(&stats.spec_trace[i].verify_ms, events[i].e[1], events[i].e[2]));
+      }
+      for (cudaEvent_t e : events[i].e) cudaEventDestroy(e);
+    }
+  }
+  stats.spec_rounds = rounds;
+  stats.spec_accepted = accepted;
 }
 
 }  // namespace ingine::model

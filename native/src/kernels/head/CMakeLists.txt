@@ -1,6 +1,7 @@
 # Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
 add_library(ingine_kernels_head STATIC
   head.cu
+  nvfp4_head.cu
 )
 ingine_cuda_target(ingine_kernels_head)
 ingine_internal_includes(ingine_kernels_head)

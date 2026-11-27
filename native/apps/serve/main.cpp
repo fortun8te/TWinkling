@@ -73,6 +73,7 @@ int main(int argc, char** argv) {
   std::string expert_plan;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   bool kv_v4 = false, kv_k4 = false, prefill_overlap = false;
+  std::string dflash2_dir;
   bool suffix_draft = false, elastic_kv = false, profile_spec = false, profile_experts = false;
   int spec_shortlist_rows = 32768;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--suffix-draft", "look up exact history continuations during greedy speculative decoding", &suffix_draft);
+  ap.option("--dflash2", "DIR", "DFlash2 drafter checkpoint directory (with --spec)", &dflash2_dir);
   ap.flag("--profile-spec", "measure verify and draft phases with CUDA events", &profile_spec);
   ap.flag("--profile-experts", "record actual GPU and host expert routes during verification", &profile_experts);
   ap.option("--draft-shortlist", "", "number of ranked DSpark head rows (1..32768)", &spec_shortlist_rows);
@@ -186,6 +188,7 @@ int main(int argc, char** argv) {
       options.elastic_kv = elastic_kv;
       options.spec = spec;
       options.suffix_draft = suffix_draft;
+    if (!dflash2_dir.empty()) options.dflash2_dir = dflash2_dir;
       options.profile_spec = profile_spec;
       options.profile_experts = profile_experts;
       options.spec_shortlist_rows = spec_shortlist_rows;

@@ -17,6 +17,7 @@
 
 #include "kernels/head/head.h"
 #include "model/drafter.h"
+#include "model/dflash2.h"
 #include "model/runtime.h"
 
 #include "ingine/generator.h"
@@ -34,7 +35,9 @@ class SpecLoop {
  public:
   // Captures the verify graph (verify_select -> switch { save_verify + decode(m) }) for `rt` and `drafter`
   // (same stream; rt with the verify widths). Both must outlive the loop.
-  SpecLoop(Runtime& rt, Drafter& drafter);
+  // flash: optional DFlash2 drafter whose proposals replace DSpark's (greedy and forced replay); the DSpark
+  // drafter then only lends its acceptance scratch and is not advanced.
+  SpecLoop(Runtime& rt, Drafter& drafter, DFlash2* flash = nullptr);
   ~SpecLoop();
   SpecLoop(const SpecLoop&) = delete;
   SpecLoop& operator=(const SpecLoop&) = delete;
@@ -52,18 +55,23 @@ class SpecLoop {
                 std::vector<std::int32_t>& tokens_in_state);
 
  private:
+  void generate_flash(std::int32_t token, int max_new_tokens, const Sampling& sampling,
+                      std::span<const std::int32_t> stop_ids,
+                      const std::function<bool(std::span<const std::int32_t>)>& on_tokens, GenerateStats& stats,
+                      std::vector<std::int32_t>& tokens_in_state);
   // The accept graph (width_select -> switch { accept + rollback + publish }) for this sampling setup.
   void prepare_accept(const Sampling& sampling);
 
   Runtime& rt_;
   Drafter& drafter_;
+  DFlash2* flash_ = nullptr;
   Drafter::Draft draft_{};             // the drafter's fixed output buffers
   DeviceBuffer width_;                 // int32: the verify width chosen on the device
   DeviceBuffer coupled_seed_;          // uint64: shared exponential-race seed for coupled speculative sampling
   MappedHostBuffer record_;            // VerifyRecord of the last round
   MappedHostBuffer forced_window_;     // forced replay: int32 [8], the forced tokens after the round's anchor
   MappedHostBuffer suffix_input_;             // optional greedy lookup tokens and confidence
-  GraphExec verify_, accept_, suffix_verify_, suffix_accept_;
+  GraphExec verify_, accept_, suffix_verify_, suffix_accept_, flash_verify_, flash_accept_;
   struct AcceptKey {
     bool greedy, forced;
     float temperature, top_p;

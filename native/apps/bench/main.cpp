@@ -141,6 +141,7 @@ int main(int argc, char** argv) {
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false, embed_host = false;
   bool kv_v4 = false, kv_k4 = false, prefill_overlap = false;
+  std::string dflash2_dir;
   bool suffix_draft = false, elastic_kv = false;
   int spec_shortlist_rows = 32768;
   int prefill_chunk = 3072, prefill_stage_mib = 0;
@@ -163,6 +164,7 @@ int main(int argc, char** argv) {
   ap.flag("--kv-k4", "compact 4-bit global keys and values (K4/V4)", &kv_k4);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
   ap.flag("--suffix-draft", "verified greedy history lookup", &suffix_draft);
+  ap.option("--dflash2", "DIR", "DFlash2 drafter checkpoint directory (with --spec)", &dflash2_dir);
   ap.option("--draft-shortlist", "", "number of ranked DSpark head rows (1..32768)", &spec_shortlist_rows);
   ap.flag("--elastic-kv", "map full-attention KV pages on demand in device memory", &elastic_kv);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
@@ -209,6 +211,7 @@ int main(int argc, char** argv) {
     options.elastic_kv = elastic_kv;
     options.spec = spec;
     options.suffix_draft = suffix_draft;
+    if (!dflash2_dir.empty()) options.dflash2_dir = dflash2_dir;
     options.spec_shortlist_rows = spec_shortlist_rows;
     options.spec_threshold = float(spec_threshold);
     options.prefill_chunk = prefill_chunk;

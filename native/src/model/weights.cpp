@@ -7,6 +7,7 @@
 // Large tensors are uploaded straight from the file with the core DeviceUploader; small per-channel
 // parameters are read on the host, widened to FP32 (exact from BF16) and copied.
 #include "model/runtime.h"
+#include "kernels/head/nvfp4_head.h"
 
 #include "core/device.h"
 #include "core/safetensors.h"
@@ -486,6 +487,32 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
       }();
       constexpr int kPiece = 16384;
       DeviceBuffer tmp(std::size_t(kPiece) * row_bytes);
+      // DFlash2 draft head: an NVFP4 copy of every row in VRAM, packed from the BF16 pieces with one global
+      // outer scale (a first pass finds the matrix amax).
+      const bool head_nvfp4 = [] {
+        const char* e = std::getenv("INGINE_HEAD_NVFP4");
+        return e && std::atoi(e) != 0;
+      }();
+      std::uint8_t *nv_codes = nullptr, *nv_scales = nullptr;
+      float nv_outer = 0.f;
+      if (head_nvfp4) {
+        for (int r0 = 0; r0 < UNPADDED_VOCAB; r0 += kPiece) {
+          const int n = std::min(kPiece, UNPADDED_VOCAB - r0);
+          const UploadRequest req{ref.file, ref->offset + std::uint64_t(r0) * row_bytes, std::uint64_t(n) * row_bytes, tmp.p};
+          head_reads += up.upload(std::span<const UploadRequest>(&req, 1), stream).read_calls;
+          nv_outer = std::max(nv_outer, kernels::head::nvfp4_outer_scale(static_cast<const __nv_bfloat16*>(tmp.p),
+                                                                          std::size_t(n) * H, stream));
+        }
+        nv_codes = static_cast<std::uint8_t*>(ld.alloc(std::size_t(UNPADDED_VOCAB) * (H / 2)));
+        nv_scales = static_cast<std::uint8_t*>(ld.alloc(std::size_t(UNPADDED_VOCAB) * (H / 16)));
+        w.unembed_nvfp4 = kernels::head::Nvfp4Matrix{nv_codes, nv_scales, nv_outer, UNPADDED_VOCAB, 0};
+      }
+      auto pack_nvfp4 = [&](int r0, int n) {
+        if (!head_nvfp4) return;
+        kernels::head::nvfp4_pack_rows(static_cast<const __nv_bfloat16*>(tmp.p), n, H, nv_outer,
+                                       nv_codes + std::size_t(r0) * (H / 2), nv_scales + std::size_t(r0) * (H / 16),
+                                       stream);
+      };
       if (lazy_head) {
         // Certified Lazy 4-Bit LM Head: Q4 proxy in VRAM (247 MiB) + exact FP8 rows in mapped host RAM (0 MiB VRAM).
         void* q4c = ld.alloc(std::size_t(UNPADDED_VOCAB) * (H / 2));
@@ -503,6 +530,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
               static_cast<std::uint8_t*>(q4s) + std::size_t(r0) * (H / 32) * 2,
               static_cast<std::uint8_t*>(fp8_host) + std::size_t(r0) * H,
               sc + r0, stream);
+          pack_nvfp4(r0, n);
           CUDA_CHECK(cudaStreamSynchronize(stream));
         }
         w.unembed = Dense{rm(fp8_host, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H}), rm(sc, DType::FP32, {UNPADDED_VOCAB})};
@@ -519,6 +547,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
           head_reads += up.upload(std::span<const UploadRequest>(&req, 1), stream).read_calls;
           kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(tmp.p), n, H,
                                    static_cast<std::uint8_t*>(q) + std::size_t(r0) * H, sc + r0, stream);
+          pack_nvfp4(r0, n);
           CUDA_CHECK(cudaStreamSynchronize(stream));  // before tmp is reused
         }
         w.unembed = Dense{rm(q, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H}), rm(sc, DType::FP32, {UNPADDED_VOCAB})};
