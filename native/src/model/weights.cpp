@@ -397,8 +397,8 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8, const
       throw std::runtime_error("weights: GGUF layer " + std::to_string(l) + " has unsupported expert types " +
                                std::to_string(gu.type) + "/" + std::to_string(dn.type));
     const std::size_t b13 = ex.g13_row * 2 * INTER * EXPERTS, b2 = ex.g2_row * H * EXPERTS;
-    void* d13 = ld.alloc(b13);
-    void* d2 = ld.alloc(b2);
+    void* d13 = ld.alloc(b13 + 64);  // + 64: the decode kernels stage 16-byte aligned spans
+    void* d2 = ld.alloc(b2 + 64);
     g.read_to_device(gu.offset, b13, d13, ld.stream());
     g.read_to_device(dn.offset, b2, d2, ld.stream());
     ex.g13 = d13;

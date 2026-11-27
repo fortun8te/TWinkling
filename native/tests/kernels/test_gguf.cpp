@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     int* didx;
     CK(cudaMalloc(&dx, H * 2));
     CK(cudaMalloc(&dq, km::q8_1_bytes(1, H)));
-    CK(cudaMalloc(&dg, std::size_t(E) * 2 * I * r13));
+    CK(cudaMalloc(&dg, std::size_t(E) * 2 * I * r13 + 64));
     CK(cudaMalloc(&dact, 8 * I * 2));
     CK(cudaMalloc(&didx, 8 * 4));
     g.read_to_device(gu.offset, std::uint64_t(E) * 2 * I * r13, dg, nullptr);
@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
       void *da, *daq, *dd2, *dys, *dw8, *dcw, *dst, *dout;
       CK(cudaMalloc(&da, 8 * I * 2));
       CK(cudaMalloc(&daq, km::q8_1_bytes(8, I)));
-      CK(cudaMalloc(&dd2, std::size_t(E) * H * r2));
+      CK(cudaMalloc(&dd2, std::size_t(E) * H * r2 + 64));
       CK(cudaMalloc(&dys, km::down_scratch_bytes()));
       CK(cudaMalloc(&dw8, 32));
       CK(cudaMalloc(&dcw, H * 16));
@@ -230,8 +230,8 @@ int main(int argc, char** argv) {
     // decode cost per call at widths 1, 2, 4, 8: tokens routed to 8 random experts each
     void *dg, *d2, *dq, *daq, *dact, *dwts, *dconv, *dstate, *dout;
     int* didx;
-    CK(cudaMalloc(&dg, std::size_t(E) * 2 * I * r13));
-    CK(cudaMalloc(&d2, std::size_t(E) * H * r2));
+    CK(cudaMalloc(&dg, std::size_t(E) * 2 * I * r13 + 64));
+    CK(cudaMalloc(&d2, std::size_t(E) * H * r2 + 64));
     g.read_to_device(gu.offset, std::uint64_t(E) * 2 * I * r13, dg, nullptr);
     g.read_to_device(dn.offset, std::uint64_t(E) * H * r2, d2, nullptr);
     CK(cudaMalloc(&dq, km::q8_1_bytes(8, H)));
